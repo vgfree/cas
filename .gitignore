@@ -1,0 +1,8 @@
+.*
+!\.gitignore
+*.bak
+*.log
+*.o
+*.a
+*.so
+*.obj

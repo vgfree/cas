@@ -1,0 +1,8 @@
+ocf_volume_t {
+	priv	------> struct vb_object {
+				struct casdsk_disk *dsk {
+						struct casdsk_exp_obj *exp_obj;
+						private;	------> ocf_core_t/ocf_cache_t
+				}
+			}
+}
