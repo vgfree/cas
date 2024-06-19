@@ -262,6 +262,16 @@ long cas_service_ioctl_ctrl(unsigned int cmd, void *arg)
 		RETURN_CMD_RESULT(cmd_info, arg, retval);
 	}
 
+	case KCAS_IOCTL_DUMP_INFLIGHT: {
+		struct kcas_dump_inflight *cmd_info;
+
+		GET_CMD_INFO(cmd_info, arg);
+
+		retval = cache_mngt_dump_inflight(cmd_info->cache_id);
+
+		RETURN_CMD_RESULT(cmd_info, arg, retval);
+	}
+
 	case KCAS_IOCTL_GET_STATS: {
 		struct kcas_get_stats *cmd_info;
 

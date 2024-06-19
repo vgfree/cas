@@ -3,44 +3,29 @@
 * SPDX-License-Identifier: BSD-3-Clause
 */
 #include <execinfo.h>
-#include <syslog.h>
 #include "ocf/ocf_logger.h"
+#include "cas_logger.h"
 #include "cas_cache.h"
 #include "context.h"
 #include "threads.h"
-
-#include "volume/vol_blk_bottom.h"
 
 
 #define CAS_LOG_RATELIMIT HZ * 5
 /* High burst limit to ensure cache init logs are printed properly */
 
 /* *** CONTEXT DATA OPERATIONS *** */
-static void *xvalloc(size_t size)
-{
-        void    *ret = NULL;
-        int     err = posix_memalign((void **)&ret, getpagesize(), size);
-
-        if (unlikely(err)) {
-                assert(0);
-        }   
-
-        memset(ret, 0, size);
-        return ret;
-}
-
 ctx_data_t *cas_ctx_data_alloc(uint32_t pages)
 {
 	struct cas_data *data = env_malloc(sizeof(*data), 0);
 	if (!data) {
-		syslog(LOG_ERR, "Couldn't allocate ctx_data.\n");
+		cas_printf(LOG_ERR, "Couldn't allocate ctx_data.\n");
 		return NULL;
 	}
 	data->my_vec.iov_len = pages * PAGE_SIZE;
 	data->my_vec.iov_base = env_malloc(pages * PAGE_SIZE, 0);
 	if (!data->my_vec.iov_base) {
 		env_free(data);
-		syslog(LOG_ERR, "Couldn't allocate my_vec.\n");
+		cas_printf(LOG_ERR, "Couldn't allocate my_vec.\n");
 		return NULL;
 	}
 
@@ -211,7 +196,7 @@ static int _cas_ctx_logger_print(ocf_logger_t logger, ocf_logger_lvl_t lvl,
 
 	void *priv = ocf_logger_get_priv(logger);
 
-	vsyslog(level[lvl], fmt, args);
+	cas_vprintf(level[lvl], fmt, args);
 
 	return 0;
 }
@@ -226,11 +211,11 @@ static int _cas_ctx_logger_dump_stack(ocf_logger_t logger)
 	int size = backtrace(trace, CTX_LOG_TRACE_DEPTH);
 	char **messages = backtrace_symbols(trace, size);
 
-	syslog(LOG_INFO, "[stack trace]>>>");
+	cas_printf(LOG_INFO, "[stack trace]>>>");
 	int i;
 	for (i = 0; i < size; ++i)
-		syslog(LOG_INFO, "%s", messages[i]);
-	syslog(LOG_INFO, "<<<[stack trace]");
+		cas_printf(LOG_INFO, "%s", messages[i]);
+	cas_printf(LOG_INFO, "<<<[stack trace]");
 	free(messages);
 
 	return 0;
@@ -279,7 +264,7 @@ int cas_initialize_context(void)
 
 	ret = load_btm_driver();
 	if (ret) {
-		syslog(LOG_ERR, "Cannot initialize block device layer\n");
+		cas_printf(LOG_ERR, "Cannot initialize block device layer\n");
 		goto err_ctx;
 
 	}

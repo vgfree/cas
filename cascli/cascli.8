@@ -283,13 +283,7 @@ Identifier of cache instance <1-16384>.
 
 .TP
 .B -w, --wake-up <NUMBER>
-Cleaning thread sleep time after an idle wake up [s] (default: 20 s).
-Idle wake up happens when there is no dirty data or the cleaning thread does not start cleaning
-due to staleness time and/or activity threshold constraints.
-
-.TP
-.B -s, --staleness-time <NUMBER>
-Time that has to pass from the last write operation before a dirty cache block can be scheduled to be flushed [s] (default: 120 s).
+Period of time between awakenings of flushing thread [ms] (default: 10 ms).
 
 .TP
 .B -b, --flush-max-buffers <NUMBER>
@@ -649,14 +643,14 @@ cascli isn't a TTY (i.e. it's output is displayed via less(1), watch(1) or
 redirected to a file)
 
 .TP
-.B CASADM_COLORS
+.B CASCLI_COLORS
 If this variable is set, colors are used even if TERM isn't set to xterm/screen
 or when output is redirected to another program. It's convenient to do:
-CASADM_COLORS=true screen 'cascli -P -i 1'
+CASCLI_COLORS=true screen 'cascli -P -i 1'
 
 .TP
-.B CASADM_NO_LINE_BREAK
-If CASADM_NO_LINE_BREAK is set, cascli won't break lines for tables displayed
+.B CASCLI_NO_LINE_BREAK
+If CASCLI_NO_LINE_BREAK is set, cascli won't break lines for tables displayed
 by -L/--list-caches, -P/--stats and -C -L/--io-class --list
 
 

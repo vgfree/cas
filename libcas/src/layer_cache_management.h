@@ -9,6 +9,10 @@
 #define CAS_BLK_DEV_REQ_TYPE_BIO 1
 #define CAS_BLK_DEV_REQ_TYPE_REQ 3
 
+int cache_mngt_set_cleaner_policy(ocf_cache_t cache, uint32_t control);
+
+int cache_mngt_get_cleaner_policy(ocf_cache_t cache, uint32_t *control);
+
 int cache_mngt_set_cleaning_policy(ocf_cache_t cache, uint32_t type);
 
 int cache_mngt_get_cleaning_policy(ocf_cache_t cache, uint32_t *type);
@@ -101,6 +105,8 @@ int cache_mngt_list_caches(struct kcas_cache_list *list);
 
 int cache_mngt_interrupt_flushing(const char *cache_name, size_t name_len);
 
+int cache_mngt_dump_inflight(uint32_t cache_id);
+
 int cache_mngt_get_stats(struct kcas_get_stats *stats);
 
 int cache_mngt_get_info(struct kcas_cache_info *info);
@@ -127,5 +133,7 @@ int cache_mngt_create_cache_standby_activate_cfg(
 
 int cache_mngt_activate(struct ocf_mngt_cache_standby_activate_config *cfg,
 		struct kcas_standby_activate *cmd);
+
+int cache_mngt_snapshot(uint32_t volume_cache_id, uint32_t snapshot_cache_id, char snapshot_cache_path_name[MAX_STR_LEN]);
 
 #endif

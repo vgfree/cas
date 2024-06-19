@@ -73,7 +73,7 @@ static int do_write(int fd, void *buf, size_t count)
 	if (rv == -1 && errno == EINTR)
 		goto retry;
 	if (rv < 0) {
-		syslog(LOG_ERR, "write errno %d", errno);
+		perror("write");
 		return rv;
 	}
 
@@ -321,7 +321,7 @@ void init_progress_bar(struct progress_status *ps)
 	}
 }
 
-void get_core_flush_progress(int fd, int cache_id, int core_id, float *prog)
+void get_core_flush_progress(int fd, uint32_t cache_id, int core_id, float *prog)
 {
 	struct kcas_core_info cmd_info;
 
@@ -335,7 +335,7 @@ void get_core_flush_progress(int fd, int cache_id, int core_id, float *prog)
 	}
 }
 
-void get_cache_flush_progress(int fd, int cache_id, float *prog)
+void get_cache_flush_progress(int fd, uint32_t cache_id, float *prog)
 {
 	struct kcas_cache_info cmd_info;
 
@@ -471,7 +471,7 @@ void *print_command_progress(void *th_arg)
  * @param retry decide if ioctl attepmts should retry
  */
 static int run_ioctl_interruptible_retry_option(int command, void *cmd, size_t len,
-		char *friendly_name, int cache_id, int core_id, bool retry)
+		char *friendly_name, uint32_t cache_id, int core_id, bool retry)
 {
 	pthread_t thread;
 	int ioctl_res;
@@ -513,7 +513,7 @@ static int run_ioctl_interruptible_retry_option(int command, void *cmd, size_t l
  * be displayed in command prompt
  */
 int run_ioctl_interruptible(int command, void *cmd, size_t len,
-		char *friendly_name, int cache_id, int core_id)
+		char *friendly_name, uint32_t cache_id, int core_id)
 {
 	return run_ioctl_interruptible_retry_option(command, cmd, len, friendly_name, 
 				cache_id, core_id, false);
@@ -527,12 +527,13 @@ int run_ioctl_interruptible(int command, void *cmd, size_t len,
  * be displayed in command prompt
  */
 int run_ioctl_interruptible_retry(int command, void *cmd, size_t len,
-		char *friendly_name, int cache_id, int core_id)
+		char *friendly_name, uint32_t cache_id, int core_id)
 {
 	return run_ioctl_interruptible_retry_option(command, cmd, len, friendly_name, 
 				cache_id, core_id, true);
 }
 
+extern int g_cas_pid;
 /*
  * @brief ioctl wrapper
  * @param[in] command as for IOCTL(2)
@@ -543,10 +544,12 @@ int run_ioctl(int command, void *cmd, size_t len)
 	struct cas_query_header h;
 	int fd, rv;
 	uint64_t length;
+	char sock_path[PATH_MAX] = {};
 
 	cas_query_init_header(&h, command, len);
 
-	fd = do_connect(CAS_QUERY_QUERY_SOCK_PATH);
+	snprintf(sock_path, sizeof(sock_path), "%s@%d", CAS_QUERY_QUERY_SOCK_PATH, g_cas_pid);
+	fd = do_connect(sock_path);
 	if (fd < 0) {
 		rv = fd;
 		goto out;

@@ -2,10 +2,12 @@
 * Copyright(c) 2012-2022 Intel Corporation
 * SPDX-License-Identifier: BSD-3-Clause
 */
-#include <syslog.h>
+#include <sys/sysinfo.h>
 
+#include "cas_logger.h"
 #include "cas_err.h"
 #include "vol_blk_top.h"
+#include "../threads.h"
 
 int cas_top_obj_lock(struct vb_object *dsk)
 {
@@ -91,7 +93,17 @@ int cas_top_obj_submit_aio(struct vb_object *dsk, struct cas_aio *aio)
 {
 	struct cas_top_obj *top_obj;
 
-	ENV_BUG_ON(!aio && !dsk);
+	ENV_BUG_ON(!aio);
+
+	if (!aio->cmpl_func) {
+		aio->result = -EINVAL;
+		return -1;
+	}
+	if (!dsk || !dsk->top_obj) {
+		aio->result = -ENODEV;
+		aio->cmpl_func(aio->cmpl_args);
+		return -1;
+	}
 
 	top_obj = dsk->top_obj;
 	top_obj->ops->submit_aio(dsk, aio, top_obj->private);
@@ -122,30 +134,52 @@ static void blkdev_complete_data(ocf_io_t io, void *priv1, void *priv2,
 	struct cas_aio *aio = priv1;
 
 	aio->result = map_cas_err_to_generic(error);
-	cas_completion_complete(&aio->cmpl);
+	aio->cmpl_func(aio->cmpl_args);
 
 	cas_ctx_data_free(data);
 	ocf_io_put(io);
 }
 
+ocf_queue_t cache_get_fastest_worker_queue(ocf_cache_t cache)
+{
+	uint32_t threads_no = cas_get_threads_no();
+	struct cache_priv *cache_priv = ocf_cache_get_priv(cache);
+	int i;
+
+	ENV_BUG_ON(!threads_no);
+
+	ocf_queue_t queue = cache_priv->queues[0].worker_queue;
+	uint32_t min_io = ocf_queue_pending_io(queue);
+	ocf_queue_t min_queue = queue;
+
+	for (i = 1; min_io && (i < threads_no); i++) {
+		queue = cache_priv->queues[i].worker_queue;
+		uint32_t cmp_io = ocf_queue_pending_io(queue);
+		if (cmp_io < min_io) {
+			min_io = cmp_io;
+			min_queue = queue;
+		}
+	}
+	return min_queue;
+}
+
 static void blkdev_handle_data(struct vb_object *bvol, struct cas_aio *aio)
 {
 	ocf_cache_t cache = ocf_volume_get_cache(bvol->front_volume);
-	struct cache_priv *cache_priv = ocf_cache_get_priv(cache);
-	ocf_queue_t queue = cache_priv->io_queues[0];//TODO:smp_processor_id()
+	ocf_queue_t queue = cache_get_fastest_worker_queue(cache);
 
 	if (!aio->vb_length) {
-		syslog(LOG_ERR, "Not able to handle empty AIO!\n");
+		cas_printf(LOG_ERR, "Not able to handle empty AIO!\n");
 		aio->result = -EINVAL;
-		cas_completion_complete(&aio->cmpl);
+		aio->cmpl_func(aio->cmpl_args);
 		return;
 	}
 
 	struct cas_data *data = cas_ctx_data_alloc(roundup(aio->vb_length, PAGE_SIZE) / PAGE_SIZE);
 	if (!data) {
-		syslog(LOG_CRIT, "AIO data vector allocation error\n");
+		cas_printf(LOG_CRIT, "AIO data vector allocation error\n");
 		aio->result = -ENOMEM;
-		cas_completion_complete(&aio->cmpl);
+		aio->cmpl_func(aio->cmpl_args);
 		return;
 	}
 	data->io_vec = aio->vb_vec;
@@ -155,10 +189,10 @@ static void blkdev_handle_data(struct vb_object *bvol, struct cas_aio *aio)
 			cas_cls_classify(cache, aio), 0);
 
 	if (!io) {
-		syslog(LOG_CRIT, "Out of memory. Ending IO processing.\n");
+		cas_printf(LOG_CRIT, "Out of memory. Ending IO processing.\n");
 		cas_ctx_data_free(data);
 		aio->result = -ENOMEM;
-		cas_completion_complete(&aio->cmpl);
+		aio->cmpl_func(aio->cmpl_args);
 		return;
 	}
 
@@ -167,7 +201,7 @@ static void blkdev_handle_data(struct vb_object *bvol, struct cas_aio *aio)
 		ocf_io_put(io);
 		cas_ctx_data_free(data);
 		aio->result = -EINVAL;
-		cas_completion_complete(&aio->cmpl);
+		aio->cmpl_func(aio->cmpl_args);
 		return;
 	}
 
@@ -184,7 +218,7 @@ static void blkdev_complete_discard(ocf_io_t io, void *priv1, void *priv2,
 	struct cas_aio *aio = priv1;
 
 	aio->result = map_cas_err_to_generic(error);
-	cas_completion_complete(&aio->cmpl);
+	aio->cmpl_func(aio->cmpl_args);
 
 	ocf_io_put(io);
 }
@@ -192,16 +226,15 @@ static void blkdev_complete_discard(ocf_io_t io, void *priv1, void *priv2,
 static void blkdev_handle_discard(struct vb_object *bvol, struct cas_aio *aio)
 {
 	ocf_cache_t cache = ocf_volume_get_cache(bvol->front_volume);
-	struct cache_priv *cache_priv = ocf_cache_get_priv(cache);
-	ocf_queue_t queue = cache_priv->io_queues[0];//TODO:smp_processor_id()
+	ocf_queue_t queue = cache_get_fastest_worker_queue(cache);
 
 	ocf_io_t io = ocf_volume_new_io(bvol->front_volume, queue,
 			aio->vb_offset, aio->vb_length, OCF_WRITE,
 			0, 0);
 	if (!io) {
-		syslog(LOG_CRIT, "Out of memory. Ending IO processing.\n");
+		cas_printf(LOG_CRIT, "Out of memory. Ending IO processing.\n");
 		aio->result = -ENOMEM;
-		cas_completion_complete(&aio->cmpl);
+		aio->cmpl_func(aio->cmpl_args);
 		return;
 	}
 
@@ -217,7 +250,7 @@ static void blkdev_complete_flush(ocf_io_t io, void *priv1, void *priv2,
 	struct cas_aio *aio = priv1;
 
 	aio->result = map_cas_err_to_generic(error);
-	cas_completion_complete(&aio->cmpl);
+	aio->cmpl_func(aio->cmpl_args);
 
 	ocf_io_put(io);
 }
@@ -225,16 +258,15 @@ static void blkdev_complete_flush(ocf_io_t io, void *priv1, void *priv2,
 static void blkdev_handle_flush(struct vb_object *bvol, struct cas_aio *aio)
 {
 	ocf_cache_t cache = ocf_volume_get_cache(bvol->front_volume);
-	struct cache_priv *cache_priv = ocf_cache_get_priv(cache);
-	ocf_queue_t queue = cache_priv->io_queues[0];//TODO:smp_processor_id()
+	ocf_queue_t queue = cache_get_fastest_worker_queue(cache);
 
 	ocf_io_t io = ocf_volume_new_io(bvol->front_volume, queue,
 			aio->vb_offset, aio->vb_length, OCF_WRITE,
 			0, 0);
 	if (!io) {
-		syslog(LOG_CRIT, "Out of memory. Ending IO processing.\n");
+		cas_printf(LOG_CRIT, "Out of memory. Ending IO processing.\n");
 		aio->result = -ENOMEM;
-		cas_completion_complete(&aio->cmpl);
+		aio->cmpl_func(aio->cmpl_args);
 		return;
 	}
 
@@ -332,7 +364,7 @@ static int kcas_volume_create_exported_object(ocf_volume_t volume,
 
 	int result = cas_top_obj_create(bvol, name, ops, priv);
 	if (result) {
-		syslog(LOG_ERR, "Cannot create exported object %s. Error code %d\n", name, result);
+		cas_printf(LOG_ERR, "Cannot create exported object %s. Error code %d\n", name, result);
 	} else {
 		bvol->expobj_valid = true;
 	}
@@ -358,7 +390,7 @@ static int kcas_volume_destroy_exported_object(ocf_volume_t volume)
 
 	result = cas_top_obj_destroy(bvol);
 	if (result) {
-		syslog(LOG_ERR, "Cannot destroy exported object %s. Error code %d\n", ocf_uuid_to_str(uuid), result);
+		cas_printf(LOG_ERR, "Cannot destroy exported object %s. Error code %d\n", ocf_uuid_to_str(uuid), result);
 	} else {
 		bvol->expobj_valid = false;
 	}
@@ -424,11 +456,11 @@ static int kcas_core_lock_exported_object(ocf_core_t core, void *cntx)
 	result = cas_top_obj_lock(bvol);
 
 	if (-EBUSY == result) {
-		syslog(LOG_WARNING, "Stopping %s failed - device in use\n",
+		cas_printf(LOG_WARNING, "Stopping %s failed - device in use\n",
 			bvol->top_obj->dev_name);
 		return -KCAS_ERR_DEV_PENDING;
 	} else if (result) {
-		syslog(LOG_WARNING, "Stopping %s failed - device unavailable\n",
+		cas_printf(LOG_WARNING, "Stopping %s failed - device unavailable\n",
 			bvol->top_obj->dev_name);
 		return -OCF_ERR_CORE_NOT_AVAIL;
 	}
@@ -450,7 +482,7 @@ static int _kcas_core_stop_exported_object(ocf_core_t core, void *cntx)
 	struct vb_object *bvol = cas_volume_get_vb_object(ocf_core_get_volume(core));
 
 	if (bvol->expobj_valid) {
-		syslog(LOG_INFO, "Stopping device %s\n", bvol->top_obj->dev_name);
+		cas_printf(LOG_INFO, "Stopping device %s\n", bvol->top_obj->dev_name);
 
 		int ret = cas_top_obj_destroy(bvol);
 		if (!ret) {

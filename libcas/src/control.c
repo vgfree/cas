@@ -6,7 +6,8 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <syslog.h>
+#include <sys/prctl.h>
+#include "cas_logger.h"
 #include "service_ui_ioctl.h"
 #include "control.h"
 #include "cas_cache.h"
@@ -38,7 +39,7 @@ static int do_write(int fd, void *buf, size_t count)
 	if (rv == -1 && errno == EINTR)
 		goto retry;
 	if (rv < 0) {
-		syslog(LOG_ERR, "write errno %d", errno);
+		cas_printf(LOG_ERR, "write errno %d", errno);
 		return rv;
 	}
 
@@ -61,7 +62,7 @@ static int setup_listener(const char *sock_path)
 
 	s = socket(AF_LOCAL, SOCK_STREAM, 0);
 	if (s < 0) {
-		syslog(LOG_ERR, "socket error %d %d", s, errno);
+		cas_printf(LOG_ERR, "socket error %d %d", s, errno);
 		return s;
 	}
 
@@ -72,14 +73,14 @@ static int setup_listener(const char *sock_path)
 
 	rv = bind(s, (struct sockaddr *) &addr, addrlen);
 	if (rv < 0) {
-		syslog(LOG_ERR, "bind error %d %d", rv, errno);
+		cas_printf(LOG_ERR, "bind error %d %d", rv, errno);
 		close(s);
 		return rv;
 	}
 
 	rv = listen(s, 5);
 	if (rv < 0) {
-		syslog(LOG_ERR, "listen error %d %d", rv, errno);
+		cas_printf(LOG_ERR, "listen error %d %d", rv, errno);
 		close(s);
 		return rv;
 	}
@@ -111,8 +112,12 @@ static void *cas_query_process(void *arg)
 	int s, f, rv;
 	char *extra = NULL;
 	int extra_len = 0;
+	char sock_path[PATH_MAX] = {};
 
-	rv = setup_listener(CAS_QUERY_QUERY_SOCK_PATH);
+	prctl(PR_SET_NAME, "control");
+	pid_t pid = getpid();
+	snprintf(sock_path, sizeof(sock_path), "%s@%d", CAS_QUERY_QUERY_SOCK_PATH, pid);
+	rv = setup_listener(sock_path);
 	if (rv < 0)
 		return NULL;
 
@@ -142,14 +147,14 @@ static void *cas_query_process(void *arg)
 			extra_len = h.length - sizeof(h);
 			extra = malloc(extra_len);
 			if (!extra) {
-				syslog(LOG_ERR, "process_connection no mem %d", extra_len);
+				cas_printf(LOG_ERR, "process_connection no mem %d", extra_len);
 				goto out;
 			}
 			memset(extra, 0, extra_len);
 
 			rv = do_read(f, extra, extra_len);
 			if (rv < 0) {
-				syslog(LOG_DEBUG, "connection %d extra read error %d", f, rv);
+				cas_printf(LOG_DEBUG, "connection %d extra read error %d", f, rv);
 				goto out;
 			}
 		}
@@ -174,7 +179,7 @@ static int cas_query_setup(void)
 
 	rv = pthread_create(&cas_query_thread, NULL, cas_query_process, NULL);
 	if (rv < 0) {
-		syslog(LOG_ERR, "can't create cas_query thread");
+		cas_printf(LOG_ERR, "can't create cas_query thread");
 		return rv;
 	}
 	return 0;

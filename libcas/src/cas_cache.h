@@ -27,14 +27,6 @@
 #define CAS_KERN_INFO KERN_INFO OCF_PREFIX_SHORT
 #define CAS_KERN_DEBUG KERN_DEBUG OCF_PREFIX_SHORT
 
-#ifndef SECTOR_SHIFT
-#define SECTOR_SHIFT 9
-#endif
-
-#ifndef SECTOR_SIZE
-#define SECTOR_SIZE (1<<SECTOR_SHIFT)
-#endif
-
 #define MAX_LINES_PER_IO	16
 
 struct cas_classifier;
@@ -47,16 +39,19 @@ struct cache_priv {
 	ocf_queue_t mngt_queue;
 	void *attach_context;
 	bool cache_exported_object_initialized;
-	ocf_queue_t io_queues[];
+	struct {
+		ocf_queue_t worker_queue;
+		ocf_queue_t porter_queue;
+	} queues[];
 };
 
 extern ocf_ctx_t cas_ctx;
 
-static inline void cache_name_from_id(char *name, uint16_t id)
+static inline void cache_name_from_id(char *name, uint32_t id)
 {
 	int result;
 
-	result = snprintf(name, OCF_CACHE_NAME_SIZE, "cache%d", id);
+	result = snprintf(name, OCF_CACHE_NAME_SIZE, "cache%"PRIu32, id);
 	ENV_BUG_ON(result >= OCF_CACHE_NAME_SIZE);
 }
 
@@ -68,18 +63,18 @@ static inline void core_name_from_id(char *name, uint16_t id)
 	ENV_BUG_ON(result >= OCF_CORE_NAME_SIZE);
 }
 
-static inline int cache_id_from_name(uint16_t *cache_id, const char *name)
+static inline int cache_id_from_name(uint32_t *cache_id, const char *name)
 {
 	const char *id_str;
 	char *endptr;
-	long res;
+	unsigned long res;
 
 	if (strnlen(name, OCF_CACHE_NAME_SIZE) < sizeof("cache") - 1)
 		return -EINVAL;
 
 	id_str = name + sizeof("cache") - 1;
 
-	res = strtol(id_str, &endptr, 10);
+	res = strtoul(id_str, &endptr, 10);
 
 	if (id_str == endptr)
 		return -EINVAL;
@@ -108,7 +103,7 @@ static inline int core_id_from_name(uint16_t *core_id, const char *name)
 	return 0;
 }
 
-static inline int mngt_get_cache_by_id(ocf_ctx_t ctx, uint16_t id,
+static inline int mngt_get_cache_by_id(ocf_ctx_t ctx, uint32_t id,
 		ocf_cache_t *cache)
 {
 	char cache_name[OCF_CACHE_NAME_SIZE];

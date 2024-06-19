@@ -2,7 +2,7 @@
 * Copyright(c) 2019-2021 Intel Corporation
 * SPDX-License-Identifier: BSD-3-Clause
 */
-#include <syslog.h>
+#include "cas_logger.h"
 #include "cas_cache.h"
 #include "classifier.h"
 #include "classifier_defs.h"
@@ -18,7 +18,7 @@
 
 /* Production version logs */
 #define CAS_CLS_MSG(severity, format, ...) \
-	syslog(severity, CAS_CLS_LOG_PREFIX " " format, ##__VA_ARGS__);
+	cas_printf(severity, CAS_CLS_LOG_PREFIX " " format, ##__VA_ARGS__);
 
 /* Set to 1 to enable debug logs */
 #define CAS_CLASSIFIER_CLS_DEBUG 0

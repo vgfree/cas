@@ -9,7 +9,9 @@
 
 #include "ocf/ocf.h"
 
-#define CAS_CPUS_ALL -1
+#define CAS_THREAD_MAX 8
+
+uint32_t cas_get_threads_no(void);
 
 int queue_thread_init(struct ocf_queue *queue, const char *name);
 

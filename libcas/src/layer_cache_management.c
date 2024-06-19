@@ -5,10 +5,11 @@
 */
 #include <sys/sysinfo.h>
 #include <string.h>
-#include <syslog.h>
+#include "cas_logger.h"
 #include "cas_cache.h"
 #include "threads.h"
 #include "volume/vol_blk_top.h"
+#include "ocf/ocf_core_priv.h"
 
 extern u32 max_writeback_queue_size;
 extern u32 writeback_queue_unblock_size;
@@ -16,18 +17,12 @@ extern u32 unaligned_io;
 extern u32 seq_cut_off_mb;
 extern u32 use_io_scheduler;
 
-static inline int env_completion_wait_interruptible(env_completion *completion)//FIXME:TODO
-{
-	sem_wait(&completion->sem);
-	return 0;
-}
 
 struct cas_lazy_thread {
 	char name[64];
-	struct task_struct *thread;
 	int (*threadfn)(void *data);
 	void *data;
-	//wait_queue_head_t wq;
+	env_completion cmpl;
 	env_atomic run;
 	env_atomic stop;
 };
@@ -38,8 +33,8 @@ static void *cas_lazy_thread_fn(void *data)
 	int (*threadfn)(void *data) = clt->threadfn;
 	void *threaddata = clt->data;
 
-	//while (wait_event_interruptible(clt->wq,
-	//		env_atomic_read(&clt->stop) || env_atomic_read(&clt->run)));
+	env_completion_wait(&clt->cmpl);
+	env_completion_destroy(&clt->cmpl);
 
 	if (env_atomic_read(&clt->stop)) {
 		env_free(clt);
@@ -65,20 +60,18 @@ static struct cas_lazy_thread *cas_lazy_thread_create(
 	vsnprintf(clt->name, sizeof(clt->name), fmt, args);
 	va_end(args);
 
-#if 0
+	clt->threadfn = threadfn;
+	clt->data = data;
+	env_atomic_set(&clt->run, 0);
+	env_atomic_set(&clt->stop, 0);
+	env_completion_init(&clt->cmpl);
+
 	pthread_t pid;
 	int ret = pthread_create(&pid, NULL, cas_lazy_thread_fn, clt);
 	if (ret) {
 		env_free(clt);
 		return NULL;
 	}
-#endif
-
-	clt->threadfn = threadfn;
-	clt->data = data;
-	//init_waitqueue_head(&clt->wq);
-	env_atomic_set(&clt->run, 0);
-	env_atomic_set(&clt->stop, 0);
 
 	return clt;
 }
@@ -89,7 +82,7 @@ static struct cas_lazy_thread *cas_lazy_thread_create(
 static void cas_lazy_thread_stop(struct cas_lazy_thread *clt)
 {
 	env_atomic_set(&clt->stop, 1);
-	//wake_up(&clt->wq);
+	env_completion_complete(&clt->cmpl);
 }
 
 /*
@@ -98,7 +91,7 @@ static void cas_lazy_thread_stop(struct cas_lazy_thread *clt)
 static void cas_lazy_thread_wake_up(struct cas_lazy_thread *clt)
 {
 	env_atomic_set(&clt->run, 1);
-	//wake_up(&clt->wq);
+	env_completion_complete(&clt->cmpl);
 }
 
 struct _cache_mngt_sync_context {
@@ -108,7 +101,7 @@ struct _cache_mngt_sync_context {
 
 struct _cache_mngt_async_context {
 	struct completion cmpl;
-	//spinlock_t lock;
+	env_spinlock lock;
 	int result;
 	void (*compl_func)(ocf_cache_t cache);
 };
@@ -126,7 +119,7 @@ static int _cache_mngt_async_callee_set_result(
 	bool interrupted;
 	int ret;
 
-	//spin_lock(&context->lock);
+	env_spinlock_lock(&context->lock);
 
 	interrupted = (context->result == -KCAS_ERR_WAITING_INTERRUPTED);
 	if (!interrupted)
@@ -134,7 +127,7 @@ static int _cache_mngt_async_callee_set_result(
 	env_completion_complete(&context->cmpl);
 
 	ret = context->result;
-	//spin_unlock(&context->lock);
+	env_spinlock_unlock(&context->lock);
 
 	return ret == ASYNC_CALL_FINISHED ? 0 : ret;
 }
@@ -146,13 +139,13 @@ static int _cache_mngt_async_caller_set_result(
 	unsigned long lock_flags = 0;
 	int result = error;
 
-	//spin_lock_irqsave(&context->lock, lock_flags);
+	env_spinlock_lock_irqsave(&context->lock, lock_flags);
 	if (context->result)
 		result = (context->result != ASYNC_CALL_FINISHED) ?
 				context->result : 0;
 	else if (result < 0)
 		result = context->result = -KCAS_ERR_WAITING_INTERRUPTED;
-	//spin_unlock_irqrestore(&context->lock, lock_flags);
+	env_spinlock_unlock_irqrestore(&context->lock, lock_flags);
 
 	return result;
 }
@@ -160,7 +153,7 @@ static int _cache_mngt_async_caller_set_result(
 static inline void _cache_mngt_async_context_init_common(
 		struct _cache_mngt_async_context *context)
 {
-	//spin_lock_init(&context->lock);
+	env_spinlock_init(&context->lock);
 	context->result = 0;
 	context->compl_func = NULL;
 }
@@ -213,6 +206,11 @@ static int _cache_mngt_lock_sync(ocf_cache_t cache)
 		env_free(context);
 
 	return result;
+}
+
+int cache_mngt_lock_sync(ocf_cache_t cache)
+{
+	return _cache_mngt_lock_sync(cache);
 }
 
 static void _cache_mngt_read_lock_complete(ocf_cache_t cache, void *priv,
@@ -612,8 +610,8 @@ static int exit_instance_finish(void *data)
 	if (result == -KCAS_ERR_WAITING_INTERRUPTED)
 		env_free(ctx);
 
-	//module_put_and_exit(0);
-	exit(0);
+	pthread_exit(NULL);
+	return result;
 }
 
 struct _cache_mngt_attach_context {
@@ -660,8 +658,7 @@ static int cache_start_rollback(void *data)
 	if (result == -KCAS_ERR_WAITING_INTERRUPTED)
 		env_free(ctx);
 
-	//module_put_and_exit(0);
-	exit(0);
+	pthread_exit(NULL);
 
 	return 0;
 }
@@ -672,7 +669,7 @@ static void _cache_mngt_cache_stop_rollback_complete(ocf_cache_t cache,
 	struct _cache_mngt_attach_context *ctx = priv;
 
 	if (error == -OCF_ERR_WRITE_CACHE)
-		syslog(LOG_WARNING, "Cannot save cache state\n");
+		cas_printf(LOG_WARNING, "Cannot save cache state\n");
 	else
 		ENV_BUG_ON(error);
 
@@ -712,10 +709,10 @@ static int _cache_mngt_cache_stop_sync(ocf_cache_t cache)
 	return result;
 }
 
-static uint16_t find_free_cache_id(ocf_ctx_t ctx)
+static uint32_t find_free_cache_id(ocf_ctx_t ctx)
 {
 	ocf_cache_t cache;
-	uint16_t id;
+	uint32_t id;
 	int result;
 
 	for (id = OCF_CACHE_ID_MIN; id < OCF_CACHE_ID_MAX; id++) {
@@ -897,6 +894,39 @@ int cache_mngt_flush_device(const char *cache_name, size_t name_len)
 	result = _cache_mngt_cache_flush_sync(cache, true,
 			_cache_read_unlock_put_cmpl);
 
+	return result;
+}
+
+int cache_mngt_set_cleaner_policy(ocf_cache_t cache, uint32_t control)
+{
+	int result;
+
+	result = _cache_mngt_lock_sync(cache);
+	if (result)
+		return result;
+
+	result = ocf_mngt_cache_cleaner_set_policy(cache, control);
+	if (result)
+		goto out;
+
+	result = _cache_mngt_save_sync(cache);
+
+out:
+	ocf_mngt_cache_unlock(cache);
+	return result;
+}
+
+int cache_mngt_get_cleaner_policy(ocf_cache_t cache, uint32_t *control)
+{
+	int result;
+
+	result = _cache_mngt_read_lock_sync(cache);
+	if (result)
+		return result;
+
+	result = ocf_mngt_cache_cleaner_get_policy(cache, control);
+
+	ocf_mngt_cache_read_unlock(cache);
 	return result;
 }
 
@@ -1103,7 +1133,7 @@ int cache_mngt_core_pool_get_paths(struct kcas_core_pool_path *cmd_info)
 
 int cache_mngt_core_pool_remove(struct kcas_core_pool_remove *cmd_info)
 {
-	struct ocf_volume_uuid uuid;
+	struct ocf_volume_uuid uuid = {};
 	ocf_volume_t vol;
 	uint8_t volume_type_id;
 
@@ -1112,7 +1142,7 @@ int cache_mngt_core_pool_remove(struct kcas_core_pool_remove *cmd_info)
 		return ret;
 
 	uuid.data = cmd_info->core_path_name;
-	uuid.size = strnlen(cmd_info->core_path_name, MAX_STR_LEN);
+	uuid.size = strnlen(cmd_info->core_path_name, MAX_STR_LEN) + 1;
 
 	vol = ocf_mngt_core_pool_lookup(cas_ctx, &uuid,
 			ocf_ctx_get_volume_type(cas_ctx, volume_type_id));
@@ -1154,23 +1184,25 @@ static void cache_mngt_metadata_probe_end(void *priv, int error,
 	env_completion_complete(&context->cmpl);
 }
 
-static int cas_create_volume_by_path(ocf_volume_t *vol, char *path)
+static int cas_create_volume_by_path(ocf_volume_t *vol, ocf_volume_form_t form, char *path)
 {
 	int path_length = strnlen(path, MAX_STR_LEN);
-	struct ocf_volume_uuid uuid;
+	struct ocf_volume_uuid uuid = {};
 	uint8_t volume_type_id;
+	int ret;
 
 	if (path_length == MAX_STR_LEN || path_length == 0)
 		return -OCF_ERR_INVAL;
 
-	int ret = cas_blk_identify_type(path, &volume_type_id);
+	ret = cas_blk_identify_type(path, &volume_type_id);
 	if (ret)
 		return ret;
 
-	uuid.data = path;
+	uuid.copy = true;
+	uuid.data = env_strdup(path, MAX_STR_LEN);
 	uuid.size = path_length + 1;
 
-	ret = ocf_ctx_volume_create(cas_ctx, vol, &uuid, volume_type_id);
+	ret = ocf_ctx_volume_create(cas_ctx, vol, form, &uuid, volume_type_id);
 	if (ret)
 		return ret;
 
@@ -1184,7 +1216,7 @@ int cache_mngt_cache_check_device(struct kcas_cache_check_device *cmd_info)
 	char holder[] = "CAS CHECK CACHE DEVICE\n";
 	int result;
 
-	result = cas_create_volume_by_path(&volume, cmd_info->path_name);
+	result = cas_create_volume_by_path(&volume, ocf_volume_form_cache, cmd_info->path_name);
 	if (result)
 		return result;
 	result = ocf_volume_open(volume, cmd_info->path_name);
@@ -1265,7 +1297,7 @@ int cache_mngt_prepare_core_cfg(struct ocf_mngt_core_config *cfg,
 
 	result = cas_blk_identify_type(cfg->uuid.data, &cfg->volume_type);
 	if (OCF_ERR_NOT_OPEN_EXC == abs(result)) {
-		syslog(LOG_WARNING, OCF_PREFIX_SHORT
+		cas_printf(LOG_WARNING, OCF_PREFIX_SHORT
 			"Cannot open device %s exclusively. "
 		        "It is already opened by another program!\n",
 			cmd_info->core_path_name);
@@ -1275,12 +1307,13 @@ int cache_mngt_prepare_core_cfg(struct ocf_mngt_core_config *cfg,
 }
 
 static int cache_mngt_update_core_uuid(ocf_cache_t cache, const char *core_name,
-				size_t name_len, ocf_uuid_t uuid)
+				size_t name_len, ocf_uuid_t uuid_ptr)
 {
 	ocf_core_t core;
 	ocf_volume_t vol;
 	struct vb_object *bdvol;
 	int result;
+	struct ocf_volume_uuid uuid = {};
 
 	if (ocf_core_get_by_name(cache, core_name, name_len, &core)) {
 		/* no such core */
@@ -1296,14 +1329,20 @@ static int cache_mngt_update_core_uuid(ocf_cache_t cache, const char *core_name,
 	vol = ocf_core_get_volume(core);
 	bdvol = cas_volume_get_vb_object(vol);
 
-	//if (!cas_bdev_match(uuid->data, bdvol->btm_bd)) {
-	//	syslog(LOG_ERR, "UUID provided does not match target core device\n");
+	//if (!cas_bdev_match(uuid_ptr->data, bdvol->btm_bd)) {
+	//	cas_printf(LOG_ERR, "UUID provided does not match target core device\n");
 	//	return -ENODEV;
 	//}
 
-	result = ocf_mngt_core_set_uuid(core, uuid);
-	if (result)
+	uuid.copy = true;
+	uuid.data = env_strdup(uuid_ptr->data, MAX_STR_LEN);
+	uuid.size = strnlen(uuid_ptr->data, MAX_STR_LEN) + 1;
+
+	result = ocf_mngt_core_set_uuid(core, &uuid);
+	if (result) {
+		env_free(uuid.data);
 		return result;
+	}
 
 	if (ocf_cache_is_device_attached(cache))
 		result = _cache_mngt_save_sync(cache);
@@ -1316,7 +1355,7 @@ static void _cache_mngt_log_core_device_path(ocf_core_t core)
 	ocf_cache_t cache = ocf_core_get_cache(core);
 	const ocf_uuid_t core_uuid = (const ocf_uuid_t)ocf_core_get_uuid(core);
 
-	syslog(LOG_INFO, OCF_PREFIX_SHORT "Adding device %s as core %s "
+	cas_printf(LOG_INFO, OCF_PREFIX_SHORT "Adding device %s as core %s "
 			"to cache %s\n", (const char*)core_uuid->data,
 			ocf_core_get_name(core), ocf_cache_get_name(cache));
 }
@@ -1367,20 +1406,26 @@ int cache_mngt_add_core_to_cache(const char *cache_name, size_t name_len,
 	ocf_core_t core;
 	ocf_core_id_t core_id;
 	int result, remove_core_result;
+	struct ocf_volume_uuid uuid = {};
 
 	result = ocf_mngt_cache_get_by_name(cas_ctx, cache_name,
 					name_len, &cache);
 	if (cfg->try_add && (result == -OCF_ERR_CACHE_NOT_EXIST)) {
-		result = ocf_mngt_core_pool_add(cas_ctx, &cfg->uuid,
+		uuid.copy = true;
+		uuid.data = env_strdup(cfg->uuid.data, MAX_STR_LEN);
+		uuid.size = strnlen(cfg->uuid.data, MAX_STR_LEN) + 1;
+
+		result = ocf_mngt_core_pool_add(cas_ctx, &uuid,
 				cfg->volume_type);
 		if (result) {
+			env_free(uuid.data);
 			cmd_info->ext_err_code =
 					-OCF_ERR_CANNOT_ADD_CORE_TO_POOL;
-			syslog(LOG_ERR, OCF_PREFIX_SHORT
+			cas_printf(LOG_ERR, OCF_PREFIX_SHORT
 					"Error occurred during"
 					" adding core to detached core pool\n");
 		} else {
-			syslog(LOG_INFO, OCF_PREFIX_SHORT
+			cas_printf(LOG_INFO, OCF_PREFIX_SHORT
 					"Successfully added"
 					" core to core pool\n");
 		}
@@ -1422,6 +1467,9 @@ int cache_mngt_add_core_to_cache(const char *cache_name, size_t name_len,
 	ocf_mngt_cache_add_core(cache, cfg, _cache_mngt_add_core_complete,
 			&add_context);
 	env_completion_wait(&add_context.cmpl);
+	if (result == -OCF_ERR_CORE_UUID_EXISTS) {
+		cmd_info->core_id = ocf_core_get_id(core);
+	}
 	if (result)
 		goto error_affter_lock;
 
@@ -1518,7 +1566,7 @@ static void _cache_mngt_remove_core_fallback(ocf_cache_t cache, ocf_core_t core)
 	struct _cache_mngt_sync_context context;
 	int result;
 
-	syslog(LOG_ERR, "Removing core failed. Detaching %s.%s\n",
+	cas_printf(LOG_ERR, "Removing core failed. Detaching %s.%s\n",
 			ocf_cache_get_name(cache),
 			ocf_core_get_name(core));
 
@@ -1533,7 +1581,7 @@ static void _cache_mngt_remove_core_fallback(ocf_cache_t cache, ocf_core_t core)
 	if (!result)
 		return;
 
-	syslog(LOG_ERR, "Detaching %s.%s\n failed. Please retry the remove operation",
+	cas_printf(LOG_ERR, "Detaching %s.%s\n failed. Please retry the remove operation",
 			ocf_cache_get_name(cache),
 			ocf_core_get_name(core));
 }
@@ -1815,7 +1863,7 @@ static int _cache_mngt_destroy_core_exported_object(ocf_core_t core, void *cntx)
 	if (kcas_core_destroy_exported_object(core)) {
 		ocf_cache_t cache = ocf_core_get_cache(core);
 
-		syslog(LOG_ERR, "Cannot to destroy exported object, %s.%s\n",
+		cas_printf(LOG_ERR, "Cannot to destroy exported object, %s.%s\n",
 				ocf_cache_get_name(cache),
 				ocf_core_get_name(core));
 	}
@@ -1849,7 +1897,7 @@ static int cache_mngt_destroy_cache_exported_object(ocf_cache_t cache)
 	ret = kcas_cache_destroy_exported_object(cache);
 
 	if (ret) {
-		syslog(LOG_ERR, "Cannot destroy %s exported object\n",
+		cas_printf(LOG_ERR, "Cannot destroy %s exported object\n",
 				ocf_cache_get_name(cache));
 	} else {
 		cache_priv->cache_exported_object_initialized = false;
@@ -1880,7 +1928,7 @@ static int cache_mngt_create_cache_device_cfg(
 
 	memset(cfg, 0, sizeof(*cfg));
 
-	result = cas_create_volume_by_path(&volume, cache_path);
+	result = cas_create_volume_by_path(&volume, ocf_volume_form_cache, cache_path);
 	if (result)
 		return result;
 
@@ -1935,12 +1983,12 @@ int cache_mngt_create_cache_cfg(struct ocf_mngt_cache_config *cfg,
 {
 	int init_cache, result;
 	char cache_name[OCF_CACHE_NAME_SIZE];
-	uint16_t cache_id;
+	uint32_t cache_id;
 
 	switch (cmd->init_cache) {
 		case CACHE_INIT_STANDBY_NEW:
 		case CACHE_INIT_STANDBY_LOAD:
-			syslog(LOG_ERR, "Standby mode is not supported!\n");
+			cas_printf(LOG_ERR, "Standby mode is not supported!\n");
 			return -ENOTSUP;
 		default:
 			break;
@@ -1952,18 +2000,18 @@ int cache_mngt_create_cache_cfg(struct ocf_mngt_cache_config *cfg,
 	if (cmd->init_cache == CACHE_INIT_LOAD ||
 			cmd->init_cache == CACHE_INIT_STANDBY_LOAD) {
 		if (cmd->cache_id != OCF_CACHE_ID_INVALID) {
-			syslog(LOG_WARNING, "Specifying cache id while loading "
+			cas_printf(LOG_WARNING, "Specifying cache id while loading "
 					"cache is forbidden\n");
 			return -OCF_ERR_INVAL;
 		}
 
 		if (cmd->line_size != ocf_cache_line_size_none) {
-			syslog(LOG_WARNING, "Specifying cache line size while "
+			cas_printf(LOG_WARNING, "Specifying cache line size while "
 					"loading cache is forbidden\n");
 			return -OCF_ERR_INVAL;
 		}
 		if (cmd->caching_mode != ocf_cache_mode_none) {
-			syslog(LOG_WARNING, "Specifying cache mode while "
+			cas_printf(LOG_WARNING, "Specifying cache mode while "
 					"loading cache is forbidden\n");
 			return -OCF_ERR_INVAL;
 		}
@@ -2021,7 +2069,7 @@ int cache_mngt_create_cache_cfg(struct ocf_mngt_cache_config *cfg,
 static void _cache_mngt_log_cache_device_path(ocf_cache_t cache,
 		const char *cache_path)
 {
-	syslog(LOG_INFO, OCF_PREFIX_SHORT "Adding device %s as cache %s\n",
+	cas_printf(LOG_INFO, OCF_PREFIX_SHORT "Adding device %s as cache %s\n",
 			cache_path, ocf_cache_get_name(cache));
 }
 
@@ -2056,41 +2104,70 @@ int cas_init_io_queue_thread(ocf_cache_t cache, ocf_queue_t q)
 
 	return queue_thread_init(q, name);
 }
+int cas_init_porter_queue_thread(ocf_cache_t cache, ocf_queue_t q)
+{
+	const char *cache_num = ocf_cache_get_name(cache) + 5;
+	char name[48] = {};
+	snprintf(name, sizeof(name), "cas_porter_%s", cache_num);
+
+	return queue_thread_init(q, name);
+}
 static int _cache_mngt_start_queues(ocf_cache_t cache)
 {
-	uint32_t cpus_no = get_nprocs();
+	uint32_t threads_no = cas_get_threads_no();
 	struct cache_priv *cache_priv;
 	int result, i;
 
 	cache_priv = ocf_cache_get_priv(cache);
 
-	for (i = 0; i < cpus_no; i++) {
-		result = ocf_queue_create(cache, &cache_priv->io_queues[i],
+	for (i = 0; i < threads_no; i++) {
+		result = ocf_queue_create(cache, &cache_priv->queues[i].worker_queue,
 				&queue_ops);
 		if (result)
-			goto err;
+			goto err_worker_queue;
 
-		result = cas_init_io_queue_thread(cache, cache_priv->io_queues[i]);
+		result = cas_init_io_queue_thread(cache, cache_priv->queues[i].worker_queue);
 		if (result) {
-			ocf_queue_put(cache_priv->io_queues[i]);
-			goto err;
+			ocf_queue_put(cache_priv->queues[i].worker_queue);
+			goto err_worker_queue;
+		}
+	}
+
+	for (i = 0; i < threads_no; i++) {
+		result = ocf_queue_create(cache, &cache_priv->queues[i].porter_queue,
+				&queue_ops);
+		if (result)
+			goto err_porter_queue;
+
+		result = cas_init_porter_queue_thread(cache, cache_priv->queues[i].porter_queue);
+		if (result) {
+			ocf_queue_put(cache_priv->queues[i].porter_queue);
+			goto err_porter_queue;
 		}
 	}
 
 	result = ocf_queue_create_mngt(cache, &cache_priv->mngt_queue, &queue_ops);
 	if (result)
-		goto err;
+		goto err_porter_queue;
 
 	result = cas_init_mngt_queue_thread(cache, cache_priv->mngt_queue);
 	if (result) {
-		ocf_queue_put(cache_priv->mngt_queue);
-		goto err;
+		goto err_mngt_queue;
 	}
 
 	return 0;
-err:
+
+err_mngt_queue:
+	ocf_queue_put(cache_priv->mngt_queue);
+	i = threads_no;
+err_porter_queue:
 	while (--i >= 0)
-		ocf_queue_put(cache_priv->io_queues[i]);
+		ocf_queue_put(cache_priv->queues[i].porter_queue);
+	i = threads_no;
+err_worker_queue:
+	while (--i >= 0) {
+		ocf_queue_put(cache_priv->queues[i].worker_queue);
+	}
 
 	return result;
 }
@@ -2139,7 +2216,7 @@ destroy_config:
 	cache_mngt_destroy_cache_device_cfg(&ctx->device_cfg);
 end:
 	if (result)
-		syslog(LOG_WARNING, "Cannot calculate amount of DRAM needed\n");
+		cas_printf(LOG_WARNING, "Cannot calculate amount of DRAM needed\n");
 }
 
 static void _cache_mngt_attach_complete(ocf_cache_t cache, void *priv,
@@ -2154,7 +2231,7 @@ static void _cache_mngt_attach_complete(ocf_cache_t cache, void *priv,
 	if (!error) {
 		path = (char *)ocf_volume_get_uuid(ocf_cache_get_volume(
 					cache))->data;
-		syslog(LOG_INFO, "Succsessfully attached %s\n", path);
+		cas_printf(LOG_INFO, "Succsessfully attached %s\n", path);
 	}
 
 	caller_status = _cache_mngt_async_callee_set_result(&ctx->async, error);
@@ -2180,7 +2257,7 @@ static void _cache_mngt_start_complete(ocf_cache_t cache, void *priv, int error)
 	if (caller_status == -KCAS_ERR_WAITING_INTERRUPTED) {
 		/* Attach/load was interrupted. Rollback asynchronously. */
 		if (!error) {
-			syslog(LOG_WARNING, "Cache added successfully, "
+			cas_printf(LOG_WARNING, "Cache added successfully, "
 					"but waiting interrupted. Rollback\n");
 		}
 		ctx->ocf_start_error = error;
@@ -2192,10 +2269,10 @@ static void _cache_mngt_start_complete(ocf_cache_t cache, void *priv, int error)
 static int _cache_mngt_cache_priv_init(ocf_cache_t cache)
 {
 	struct cache_priv *cache_priv;
-	uint32_t cpus_no = get_nprocs();
+	uint32_t threads_no = cas_get_threads_no();
 
 	cache_priv = env_zalloc(sizeof(*cache_priv) +
-			cpus_no * sizeof(*cache_priv->io_queues), 0);
+			threads_no * sizeof(*cache_priv->queues), 0);
 	if (!cache_priv)
 		return -ENOMEM;
 
@@ -2230,13 +2307,13 @@ static void cache_mngt_probe_metadata_end(void *priv, int error,
 	*context->result = error;
 
 	if (error == -OCF_ERR_NO_METADATA) {
-		syslog(LOG_ERR, "No cache metadata found!\n");
+		cas_printf(LOG_ERR, "No cache metadata found!\n");
 		goto err;
 	} else if (error == -OCF_ERR_METADATA_VER) {
-		syslog(LOG_ERR, "Cache metadata version mismatch\n");
+		cas_printf(LOG_ERR, "Cache metadata version mismatch\n");
 		goto err;
 	} else if (error) {
-		syslog(LOG_ERR, "Failed to load cache metadata!\n");
+		cas_printf(LOG_ERR, "Failed to load cache metadata!\n");
 		goto err;
 	}
 
@@ -2257,7 +2334,7 @@ static int _cache_mngt_probe_metadata(char *cache_path_name,
 	char holder[] = "CAS CHECK METADATA\n";
 	int result;
 
-	result = cas_create_volume_by_path(&volume, cache_path_name);
+	result = cas_create_volume_by_path(&volume, ocf_volume_form_cache, cache_path_name);
 	if (result)
 		return result;
 	result = ocf_volume_open(volume, cache_path_name);
@@ -2386,25 +2463,25 @@ static int cache_mngt_check_bdev(struct ocf_mngt_cache_device_config *cfg,
 
 		if (blk_stack_limits(&tmp_limits, &bdev->bd_disk->queue->limits, 0)) {
 			reattach_properties_diff = true;
-			syslog(LOG_WARNING, "New cache device block properties "
+			cas_printf(LOG_WARNING, "New cache device block properties "
 					"differ from the previous one.\n");
 		}
 		if (tmp_limits.misaligned) {
 			reattach_properties_diff = true;
-			syslog(LOG_WARNING, "New cache device block interval "
+			cas_printf(LOG_WARNING, "New cache device block interval "
 					"doesn't line up with the previous one.\n");
 		}
 		if (CAS_CHECK_QUEUE_FLUSH(bdev->bd_disk->queue) !=
 				cache_priv->device_properties.flush) {
 			reattach_properties_diff = true;
-			syslog(LOG_WARNING, "New cache device %s support flush "
+			cas_printf(LOG_WARNING, "New cache device %s support flush "
 					"in contrary to the previous cache device.\n",
 					cache_priv->device_properties.flush ? "doesn't" : "does");
 		}
 		if (CAS_CHECK_QUEUE_FUA(bdev->bd_disk->queue) !=
 				cache_priv->device_properties.fua) {
 			reattach_properties_diff = true;
-			syslog(LOG_WARNING, "New cache device %s support fua "
+			cas_printf(LOG_WARNING, "New cache device %s support fua "
 					"in contrary to the previous cache device.\n",
 					cache_priv->device_properties.fua ? "doesn't" : "does");
 		}
@@ -2683,7 +2760,7 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 		case CACHE_INIT_STANDBY_NEW:
 		case CACHE_INIT_STANDBY_LOAD:
 			ocf_volume_destroy(attach_cfg->device.volume);
-			syslog(LOG_ERR, "Standby mode is not supported!\n");
+			cas_printf(LOG_ERR, "Standby mode is not supported!\n");
 			return -ENOTSUP;
 	case CACHE_INIT_LOAD:
 		result = _cache_mngt_probe_metadata(cmd->cache_path_name,
@@ -2697,7 +2774,7 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 		/* Need to return name from metadata now for caller to properly
 		 * communicate the error to user */
 		if (cache_id_from_name(&cmd->cache_id, cache_name_meta)) {
-			syslog(LOG_ERR, "Improper cache name format on %s.\n",
+			cas_printf(LOG_ERR, "Improper cache name format on %s.\n",
 					cmd->cache_path_name);
 
 			ocf_volume_destroy(attach_cfg->device.volume);
@@ -2708,7 +2785,7 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 				OCF_CACHE_NAME_SIZE, &tmp_cache);
 
 		if (result != -OCF_ERR_CACHE_NOT_EXIST) {
-			syslog(LOG_ERR, "Can't load %s. Cache using that name "
+			cas_printf(LOG_ERR, "Can't load %s. Cache using that name "
 					"already exists.\n", cache_name_meta);
 
 			ocf_mngt_cache_put(tmp_cache);
@@ -2827,6 +2904,170 @@ err:
 	if (rollback_result != -KCAS_ERR_WAITING_INTERRUPTED)
 		env_free(context);
 
+	return result;
+}
+
+struct ocf_mngt_cache_snapshot_config {
+	char volume_core_path_name[OCF_CORE_MAX][MAX_STR_LEN];
+	char snapshot_core_path_name[OCF_CORE_MAX][MAX_STR_LEN];
+	uint32_t volume_cache_id;
+	uint32_t snapshot_cache_id;
+};
+
+static int _cache_mngt_backup_all_core(ocf_core_t core, void *cntx)
+{
+	struct ocf_mngt_cache_snapshot_config *snapshot_cfg = (struct ocf_mngt_cache_snapshot_config *)cntx;
+	uint16_t core_id = OCF_CORE_ID_INVALID;
+	core_id_from_name(&core_id, ocf_core_get_name(core));
+	char *volume_path_name = snapshot_cfg->volume_core_path_name[core_id];
+
+	ocf_volume_t volume = ocf_core_get_volume(core);
+	const struct ocf_volume_uuid *uuid = ocf_volume_get_uuid(volume);
+	return env_memcpy(volume_path_name, MAX_STR_LEN, uuid->data, uuid->size);
+}
+
+static int _cache_mngt_snapshot_all_core(ocf_core_t core, void *cntx)
+{
+	struct ocf_mngt_cache_snapshot_config *snapshot_cfg = (struct ocf_mngt_cache_snapshot_config *)cntx;
+	uint16_t core_id = OCF_CORE_ID_INVALID;
+	core_id_from_name(&core_id, ocf_core_get_name(core));
+	char *snapshot_path_name = snapshot_cfg->snapshot_core_path_name[core_id];
+
+	ocf_volume_t core_vol = ocf_core_get_volume(core);
+	return ocf_volume_snapshot(core_vol, snapshot_path_name);
+}
+
+static int _cache_mngt_revise_all_core(ocf_core_t core, void *cntx)
+{
+	struct ocf_mngt_cache_snapshot_config *snapshot_cfg = (struct ocf_mngt_cache_snapshot_config *)cntx;
+	uint16_t core_id = OCF_CORE_ID_INVALID;
+	core_id_from_name(&core_id, ocf_core_get_name(core));
+	char *snapshot_path_name = snapshot_cfg->snapshot_core_path_name[core_id];
+
+	struct ocf_volume_uuid uuid = {};
+	uuid.copy = true;
+	uuid.data = env_strdup(snapshot_path_name, MAX_STR_LEN);
+	uuid.size = strnlen(snapshot_path_name, MAX_STR_LEN) + 1;
+
+	int result = ocf_mngt_core_set_uuid(core, &uuid);
+	if (result)
+		env_free(uuid.data);
+	return result;
+}
+
+static int _cache_mngt_resume_all_core(ocf_core_t core, void *cntx)
+{
+	struct ocf_mngt_cache_snapshot_config *snapshot_cfg = (struct ocf_mngt_cache_snapshot_config *)cntx;
+	uint16_t core_id = OCF_CORE_ID_INVALID;
+	core_id_from_name(&core_id, ocf_core_get_name(core));
+	char *volume_path_name = snapshot_cfg->volume_core_path_name[core_id];
+
+	struct ocf_volume_uuid uuid = {};
+	uuid.copy = true;
+	uuid.data = env_strdup(volume_path_name, MAX_STR_LEN);
+	uuid.size = strnlen(volume_path_name, MAX_STR_LEN) + 1;
+
+	int result = ocf_mngt_core_set_uuid(core, &uuid);
+	if (result)
+		env_free(uuid.data);
+	return result;
+}
+
+extern int ocf_cache_set_name(ocf_cache_t cache, const char *src, size_t src_size);
+
+int cache_mngt_snapshot(uint32_t volume_cache_id, uint32_t snapshot_cache_id, char snapshot_cache_path_name[MAX_STR_LEN])
+{
+	ocf_cache_t cache;
+	char cache_name[OCF_CACHE_NAME_SIZE] = {};
+	int result;
+
+	cache_name_from_id(cache_name, volume_cache_id);
+	result = ocf_mngt_cache_get_by_name(cas_ctx, cache_name, OCF_CACHE_NAME_SIZE, &cache);
+	if (result) {
+		return result;
+	}
+
+	if (ocf_cache_is_standby(cache)) {
+		ocf_mngt_cache_put(cache);
+		return -OCF_ERR_CACHE_STANDBY;
+	}
+
+	result = _cache_mngt_lock_sync(cache);
+	if (result) {
+		ocf_mngt_cache_put(cache);
+		return result;
+	}
+
+	struct ocf_mngt_cache_snapshot_config *snapshot_cfg = env_zalloc(sizeof(*snapshot_cfg), 0);
+	if (!snapshot_cfg) {
+		ocf_mngt_cache_unlock(cache);
+		ocf_mngt_cache_put(cache);
+		return result;
+	}
+	snapshot_cfg->snapshot_cache_id = snapshot_cache_id;
+	snapshot_cfg->volume_cache_id = volume_cache_id;
+
+	/* STEP 1: stop io */
+	//TODO:
+
+	/* STEP 2: stop cleaner */
+	//TODO:
+
+	/* STEP 3: backup cores */
+	result = ocf_core_visit(cache, _cache_mngt_backup_all_core, snapshot_cfg, false);
+	if (result) {
+		goto out;
+	}
+
+	/* STEP 4: snapshot cores */
+	result = ocf_core_visit(cache, _cache_mngt_snapshot_all_core, snapshot_cfg, false);
+	if (result) {
+		goto out;
+	}
+
+	/* STEP 5: revise cache */
+	result = ocf_core_visit(cache, _cache_mngt_revise_all_core, snapshot_cfg, false);
+	if (result) {
+		goto out;
+	}
+	cache_name_from_id(cache_name, snapshot_cache_id);
+	result = ocf_cache_set_name(cache, cache_name, OCF_CACHE_NAME_SIZE);
+	if (result) {
+		goto out;
+	}
+	result = _cache_mngt_save_sync(cache);
+
+	/* STEP 6: snapshot cache */
+	ocf_volume_t cache_vol = ocf_cache_get_volume(cache);
+	result = ocf_volume_snapshot(cache_vol, snapshot_cache_path_name);
+	if (result) {
+		goto out;
+	}
+
+	/* STEP 7: resume cache */
+	result = ocf_core_visit(cache, _cache_mngt_resume_all_core, snapshot_cfg, false);
+	if (result) {
+		goto out;
+	}
+	cache_name_from_id(cache_name, volume_cache_id);
+	result = ocf_cache_set_name(cache, cache_name, OCF_CACHE_NAME_SIZE);
+	if (result) {
+		goto out;
+	}
+	result = _cache_mngt_save_sync(cache);
+	if (result) {
+		goto out;
+	}
+
+	/* STEP 8: start cleaner */
+
+	/* STEP 9: start io */
+
+out:
+	env_free(snapshot_cfg);
+
+	ocf_mngt_cache_unlock(cache);
+	ocf_mngt_cache_put(cache);
 	return result;
 }
 
@@ -3059,7 +3300,7 @@ int cache_mngt_set_cache_mode(const char *cache_name, size_t name_len,
 
 	old_mode = ocf_cache_get_mode(cache);
 	if (old_mode == mode) {
-		syslog(LOG_INFO, "%s is in requested cache mode already\n", cache_name);
+		cas_printf(LOG_INFO, "%s is in requested cache mode already\n", cache_name);
 		result = 0;
 		goto put;
 	}
@@ -3075,7 +3316,7 @@ int cache_mngt_set_cache_mode(const char *cache_name, size_t name_len,
 		goto put;
 
 	if (old_mode != ocf_cache_get_mode(cache)) {
-		syslog(LOG_WARNING, "%s cache mode changed during flush\n",
+		cas_printf(LOG_WARNING, "%s cache mode changed during flush\n",
 				ocf_cache_get_name(cache));
 		goto unlock;
 	}
@@ -3092,7 +3333,7 @@ int cache_mngt_set_cache_mode(const char *cache_name, size_t name_len,
 
 	result = _cache_mngt_save_sync(cache);
 	if (result) {
-		syslog(LOG_ERR, "%s: Failed to save new cache mode. "
+		cas_printf(LOG_ERR, "%s: Failed to save new cache mode. "
 				"Restoring old one!\n", cache_name);
 		ocf_mngt_cache_set_mode(cache, old_mode);
 	}
@@ -3136,7 +3377,7 @@ int cache_mngt_detach_cache(const char *cache_name, size_t name_len)
 	status = _cache_mngt_async_caller_set_result(context, status);
 
 	if (status == -KCAS_ERR_WAITING_INTERRUPTED) {
-		syslog(LOG_WARNING, "Waiting for cache detach interrupted. "
+		cas_printf(LOG_WARNING, "Waiting for cache detach interrupted. "
 				"The operation will finish asynchronously.\n");
 		goto err_int;
 	}
@@ -3203,14 +3444,14 @@ int cache_mngt_exit_instance(const char *cache_name, size_t name_len, int flush)
 	if (!ocf_cache_is_standby(cache)) {
 		status = kcas_cache_destroy_all_core_exported_objects(cache);
 		if (status != 0) {
-			syslog(LOG_WARNING,
+			cas_printf(LOG_WARNING,
 					"Failed to remove all cached devices\n");
 			goto stop_thread;
 		}
 	} else {
 		status = cache_mngt_destroy_cache_exported_object(cache);
 		if (status != 0) {
-			syslog(LOG_WARNING,
+			cas_printf(LOG_WARNING,
 					"Failed to remove cache exported object\n");
 			goto stop_thread;
 		}
@@ -3227,7 +3468,7 @@ int cache_mngt_exit_instance(const char *cache_name, size_t name_len, int flush)
 	/* Stop cache device - ignore interrupts */
 	status = _cache_mngt_cache_stop_sync(cache);
 	if (status == -KCAS_ERR_WAITING_INTERRUPTED)
-		syslog(LOG_WARNING,
+		cas_printf(LOG_WARNING,
 				"Waiting for cache stop interrupted. "
 				"Stop will finish asynchronously.\n");
 
@@ -3257,7 +3498,7 @@ static int cache_mngt_list_caches_visitor(ocf_cache_t cache, void *cntx)
 {
 	struct cache_mngt_list_ctx *context = cntx;
 	struct kcas_cache_list *list = context->list;
-	uint16_t id;
+	uint32_t id;
 
 	ENV_BUG_ON(cache_id_from_name(&id, ocf_cache_get_name(cache)));
 
@@ -3305,6 +3546,55 @@ int cache_mngt_interrupt_flushing(const char *cache_name, size_t name_len)
 
 	return 0;
 
+}
+
+static int _cache_mngt_dump_inflight_all_core(ocf_core_t core, void *cntx)
+{
+	//uint16_t core_id = OCF_CORE_ID_INVALID;
+	//core_id_from_name(&core_id, ocf_core_get_name(core));
+
+	ocf_volume_t core_vol = ocf_core_get_volume(core);
+	ocf_volume_dump_inflight(core_vol);
+	return 0;
+}
+
+int cache_mngt_dump_inflight(uint32_t cache_id)
+{
+	ocf_cache_t cache;
+	ocf_volume_t cache_vol;
+	char cache_name[OCF_CACHE_NAME_SIZE] = {};
+	int result;
+
+	cache_name_from_id(cache_name, cache_id);
+	result = ocf_mngt_cache_get_by_name(cas_ctx, cache_name, OCF_CACHE_NAME_SIZE, &cache);
+	if (result) {
+		return result;
+	}
+
+	if (ocf_cache_is_standby(cache)) {
+		ocf_mngt_cache_put(cache);
+		return -OCF_ERR_CACHE_STANDBY;
+	}
+
+	result = _cache_mngt_lock_sync(cache);
+	if (result) {
+		ocf_mngt_cache_put(cache);
+		return result;
+	}
+
+	cache_vol = ocf_cache_get_volume(cache);
+	ocf_volume_dump_inflight(cache_vol);
+
+	result = ocf_core_visit(cache, _cache_mngt_dump_inflight_all_core, NULL, false);
+	if (result) {
+		ocf_mngt_cache_unlock(cache);
+		ocf_mngt_cache_put(cache);
+		return result;
+	}
+
+	ocf_mngt_cache_unlock(cache);
+	ocf_mngt_cache_put(cache);
+	return result;
 }
 
 int cache_mngt_get_stats(struct kcas_get_stats *stats)
@@ -3408,7 +3698,7 @@ put:
 int cache_mngt_get_io_class_info(struct kcas_io_class *part)
 {
 	int result;
-	uint16_t cache_id = part->cache_id;
+	uint32_t cache_id = part->cache_id;
 	uint32_t io_class_id = part->class_id;
 	ocf_cache_t cache;
 
@@ -3563,6 +3853,11 @@ int cache_mngt_set_cache_params(struct kcas_set_cache_param *info)
 		return result;
 
 	switch (info->param_id) {
+	case cache_param_cleaner_policy_control:
+		result = cache_mngt_set_cleaner_policy(cache,
+				info->param_value);
+		break;
+
 	case cache_param_cleaning_policy_type:
 		result = cache_mngt_set_cleaning_policy(cache,
 				info->param_value);
@@ -3573,9 +3868,9 @@ int cache_mngt_set_cache_params(struct kcas_set_cache_param *info)
 				ocf_cleaning_alru, ocf_alru_wake_up_time,
 				info->param_value);
 		break;
-	case cache_param_cleaning_alru_stale_buffer_time:
+	case cache_param_cleaning_alru_flush_split_unit:
 		result = cache_mngt_set_cleaning_param(cache,
-				ocf_cleaning_alru, ocf_alru_stale_buffer_time,
+				ocf_cleaning_alru, ocf_alru_flush_split_unit,
 				info->param_value);
 		break;
 	case cache_param_cleaning_alru_flush_max_buffers:
@@ -3588,10 +3883,20 @@ int cache_mngt_set_cache_params(struct kcas_set_cache_param *info)
 				ocf_cleaning_alru, ocf_alru_activity_threshold,
 				info->param_value);
 		break;
+	case cache_param_cleaning_alru_dirty_overflow_threshold:
+		result = cache_mngt_set_cleaning_param(cache,
+				ocf_cleaning_alru, ocf_alru_dirty_overflow_threshold,
+				info->param_value);
+		break;
 
 	case cache_param_cleaning_acp_wake_up_time:
 		result = cache_mngt_set_cleaning_param(cache,
 				ocf_cleaning_acp, ocf_acp_wake_up_time,
+				info->param_value);
+		break;
+	case cache_param_cleaning_acp_flush_split_unit:
+		result = cache_mngt_set_cleaning_param(cache,
+				ocf_cleaning_acp, ocf_acp_flush_split_unit,
 				info->param_value);
 		break;
 	case cache_param_cleaning_acp_flush_max_buffers:
@@ -3599,6 +3904,17 @@ int cache_mngt_set_cache_params(struct kcas_set_cache_param *info)
 				ocf_cleaning_acp, ocf_acp_flush_max_buffers,
 				info->param_value);
 		break;
+	case cache_param_cleaning_acp_activity_threshold:
+		result = cache_mngt_set_cleaning_param(cache,
+				ocf_cleaning_acp, ocf_acp_activity_threshold,
+				info->param_value);
+		break;
+	case cache_param_cleaning_acp_dirty_overflow_threshold:
+		result = cache_mngt_set_cleaning_param(cache,
+				ocf_cleaning_acp, ocf_acp_dirty_overflow_threshold,
+				info->param_value);
+		break;
+
 	case cache_param_promotion_policy_type:
 		result = cache_mngt_set_promotion_policy(cache, info->param_value);
 		break;
@@ -3628,6 +3944,11 @@ int cache_mngt_get_cache_params(struct kcas_get_cache_param *info)
 		return result;
 
 	switch (info->param_id) {
+	case cache_param_cleaner_policy_control:
+		result = cache_mngt_get_cleaner_policy(cache,
+				&info->param_value);
+		break;
+
 	case cache_param_cleaning_policy_type:
 		result = cache_mngt_get_cleaning_policy(cache,
 				&info->param_value);
@@ -3637,9 +3958,9 @@ int cache_mngt_get_cache_params(struct kcas_get_cache_param *info)
 				ocf_cleaning_alru, ocf_alru_wake_up_time,
 				&info->param_value);
 		break;
-	case cache_param_cleaning_alru_stale_buffer_time:
+	case cache_param_cleaning_alru_flush_split_unit:
 		result = cache_mngt_get_cleaning_param(cache,
-				ocf_cleaning_alru, ocf_alru_stale_buffer_time,
+				ocf_cleaning_alru, ocf_alru_flush_split_unit,
 				&info->param_value);
 		break;
 	case cache_param_cleaning_alru_flush_max_buffers:
@@ -3652,10 +3973,20 @@ int cache_mngt_get_cache_params(struct kcas_get_cache_param *info)
 				ocf_cleaning_alru, ocf_alru_activity_threshold,
 				&info->param_value);
 		break;
+	case cache_param_cleaning_alru_dirty_overflow_threshold:
+		result = cache_mngt_get_cleaning_param(cache,
+				ocf_cleaning_alru, ocf_alru_dirty_overflow_threshold,
+				&info->param_value);
+		break;
 
 	case cache_param_cleaning_acp_wake_up_time:
 		result = cache_mngt_get_cleaning_param(cache,
 				ocf_cleaning_acp, ocf_acp_wake_up_time,
+				&info->param_value);
+		break;
+	case cache_param_cleaning_acp_flush_split_unit:
+		result = cache_mngt_get_cleaning_param(cache,
+				ocf_cleaning_acp, ocf_acp_flush_split_unit,
 				&info->param_value);
 		break;
 	case cache_param_cleaning_acp_flush_max_buffers:
@@ -3663,6 +3994,17 @@ int cache_mngt_get_cache_params(struct kcas_get_cache_param *info)
 				ocf_cleaning_acp, ocf_acp_flush_max_buffers,
 				&info->param_value);
 		break;
+	case cache_param_cleaning_acp_activity_threshold:
+		result = cache_mngt_get_cleaning_param(cache,
+				ocf_cleaning_acp, ocf_acp_activity_threshold,
+				&info->param_value);
+		break;
+	case cache_param_cleaning_acp_dirty_overflow_threshold:
+		result = cache_mngt_get_cleaning_param(cache,
+				ocf_cleaning_acp, ocf_acp_dirty_overflow_threshold,
+				&info->param_value);
+		break;
+
 	case cache_param_promotion_policy_type:
 		result = cache_mngt_get_promotion_policy(cache, &info->param_value);
 		break;

@@ -11,7 +11,8 @@
 /**
  * cache/core object types */
 enum {
-	BLOCK_DEVICE_VOLUME = 1,	/**< block device volume */
+	VOLUME_TYPE_BLOCK_DEVICE = 1,	/**< block device volume */
+	VOLUME_TYPE_BLOCK_SAGOCYCAS = 2,	/**< block sagocycas volume */
 /** \cond SKIP_IN_DOC */
 	OBJECT_TYPE_MAX,
 /** \endcond */

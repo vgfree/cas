@@ -6,20 +6,20 @@
 #include <sys/mount.h>
 #include <sys/file.h>
 #include <fcntl.h>
-#include <syslog.h>
-#include "vol_blk_bottom.h"
+
+#include "../cas_logger.h"
 #include "../cas_cache.h"
 
 #define CAS_DEBUG_IO 0
 
 #if CAS_DEBUG_IO == 1
-#define CAS_DEBUG_TRACE() syslog(LOG_DEBUG, \
+#define CAS_DEBUG_TRACE() cas_printf(LOG_DEBUG, \
 		"[IO] %s:%d\n", __func__, __LINE__)
 
-#define CAS_DEBUG_MSG(msg) syslog(LOG_DEBUG, \
+#define CAS_DEBUG_MSG(msg) cas_printf(LOG_DEBUG, \
 		"[IO] %s:%d - %s\n", __func__, __LINE__, msg)
 
-#define CAS_DEBUG_PARAM(format, ...) syslog(LOG_DEBUG, \
+#define CAS_DEBUG_PARAM(format, ...) cas_printf(LOG_DEBUG, \
 		"[IO] %s:%d - "format"\n", __func__, __LINE__, ##__VA_ARGS__)
 #else
 #define CAS_DEBUG_TRACE()
@@ -98,17 +98,18 @@ static int cas_disk_open(struct vb_object *dsk, const char *path, void *private)
 
 	dsk->path = strdup(path);
 	if (!dsk->path) {
+		cas_printf(LOG_ERR, "no memory!");
 		goto error_strdup;
 	}
 
 	int fd = open(path, O_RDWR);
 	if (fd < 0) {
-		syslog(LOG_ERR, "Cannot open %s", path);
+		cas_printf(LOG_ERR, "Cannot open %s", path);
 		goto error_open_bdev;
 	}
 	int ret = flock(fd, LOCK_EX);
 	if (ret < 0) {
-		syslog(LOG_ERR, "Cannot lock %s", path);
+		cas_printf(LOG_ERR, "Cannot lock %s", path);
 		close(fd);
 		goto error_open_bdev;
 	}
@@ -116,14 +117,14 @@ static int cas_disk_open(struct vb_object *dsk, const char *path, void *private)
 	dsk->btm_obj = (void *)(uintptr_t)fd;
 	dsk->private = private;
 
-	syslog(LOG_DEBUG, "Created (%p)", dsk);
+	cas_printf(LOG_DEBUG, "Created (%p)", dsk);
 
 	return 0;
 
 error_open_bdev:
 	env_free(dsk->path);
+	dsk->path = NULL;
 error_strdup:
-	env_free(dsk);
 	return -1;
 }
 
@@ -132,16 +133,18 @@ static void cas_disk_close(struct vb_object *dsk)
 	ENV_BUG_ON(!dsk);
 	ENV_BUG_ON(!dsk->btm_obj);
 
-	syslog(LOG_DEBUG, "Destroying (%p)", dsk);
+	cas_printf(LOG_DEBUG, "Destroying (%p)", dsk);
 
 	int fd = (uintptr_t)dsk->btm_obj;
 	flock(fd, LOCK_UN);
 	close(fd);
+	dsk->btm_obj = NULL;
 
 	env_free(dsk->path);
+	dsk->path = NULL;
 }
 
-static int block_dev_open_object(ocf_volume_t vol, void *volume_params)
+static int device_open_object(ocf_volume_t vol, void *volume_params)
 {
 	struct vb_object *bdobj = cas_volume_get_vb_object(vol);
 	const struct ocf_volume_uuid *uuid = ocf_volume_get_uuid(vol);
@@ -159,19 +162,19 @@ static int block_dev_open_object(ocf_volume_t vol, void *volume_params)
 	return 0;
 }
 
-static void block_dev_close_object(ocf_volume_t vol)
+static void device_close_object(ocf_volume_t vol)
 {
 	struct vb_object *bdobj = cas_volume_get_vb_object(vol);
 
 	cas_disk_close(bdobj);
 }
 
-static unsigned int block_dev_get_max_io_size(ocf_volume_t vol)
+static unsigned int device_get_max_io_size(ocf_volume_t vol)
 {
 	return 1 << 30;
 }
 
-static uint64_t block_dev_get_byte_length(ocf_volume_t vol)
+static uint64_t device_get_byte_length(ocf_volume_t vol)
 {
 	struct vb_object *bdobj = cas_volume_get_vb_object(vol);
 
@@ -184,7 +187,31 @@ static uint64_t block_dev_get_byte_length(ocf_volume_t vol)
 	return size;
 }
 
-static void block_dev_forward_flush(ocf_volume_t volume, ocf_forward_token_t token)
+int device_snapshot(ocf_volume_t vol, char snapshot_path[PATH_MAX])
+{
+	struct vb_object *bdobj = cas_volume_get_vb_object(vol);
+	const struct ocf_volume_uuid *uuid = ocf_volume_get_uuid(vol);
+
+	char tmp[128] = {};
+	time_t now;
+	time(&now);
+	struct tm *tm = localtime(&now);
+	strftime(tmp, sizeof(tmp), "%Y-%m-%d_%H:%M:%S", tm);
+
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	snprintf(snapshot_path, PATH_MAX, "/dev/loop%ld", tv.tv_usec);
+
+	char fname[PATH_MAX] = {};
+	snprintf(fname, PATH_MAX, "%s.snapshot_%s__%ld", ocf_uuid_to_str(uuid), tmp, tv.tv_usec);
+
+	char cmd[2*PATH_MAX + 5] = {};
+	sprintf(cmd, "cp %s %s", ocf_uuid_to_str(uuid), fname);
+	system(cmd);
+	return 0;
+}
+
+static void device_forward_flush(ocf_volume_t volume, ocf_forward_token_t token)
 {
 	struct vb_object *bdobj = cas_volume_get_vb_object(volume);
 	struct cas_data *data = ocf_forward_get_data(token);
@@ -192,7 +219,7 @@ static void block_dev_forward_flush(ocf_volume_t volume, ocf_forward_token_t tok
 #if 0
 	ocf_cache_t cache = ocf_volume_get_cache(volume);
 	if (ocf_cache_is_stopping(cache)) {
-		syslog(LOG_INFO, "cache is stopping, ignore io\n");
+		cas_printf(LOG_INFO, "cache is stopping, ignore io\n");
 		ocf_forward_end(token, -EINTR);
 		return;
 	}
@@ -202,7 +229,7 @@ static void block_dev_forward_flush(ocf_volume_t volume, ocf_forward_token_t tok
 	ocf_forward_end(token, err);
 }
 
-static void block_dev_forward_discard(ocf_volume_t volume, ocf_forward_token_t token,
+static void device_forward_discard(ocf_volume_t volume, ocf_forward_token_t token,
 		uint64_t addr, uint64_t bytes)
 {
 	struct vb_object *bdobj = cas_volume_get_vb_object(volume);
@@ -211,7 +238,7 @@ static void block_dev_forward_discard(ocf_volume_t volume, ocf_forward_token_t t
 #if 0
 	ocf_cache_t cache = ocf_volume_get_cache(volume);
 	if (ocf_cache_is_stopping(cache)) {
-		syslog(LOG_INFO, "cache is stopping, ignore io\n");
+		cas_printf(LOG_INFO, "cache is stopping, ignore io\n");
 		ocf_forward_end(token, -EINTR);
 		return;
 	}
@@ -223,7 +250,7 @@ static void block_dev_forward_discard(ocf_volume_t volume, ocf_forward_token_t t
 /*
  *
  */
-static void block_dev_forward_io(ocf_volume_t volume, ocf_forward_token_t token,
+static void device_forward_io(ocf_volume_t volume, ocf_forward_token_t token,
 		int dir, uint64_t addr, uint64_t bytes, uint64_t offset)
 {
 	struct vb_object *bdobj = cas_volume_get_vb_object(volume);
@@ -237,7 +264,7 @@ static void block_dev_forward_io(ocf_volume_t volume, ocf_forward_token_t token,
 
 	if (!bytes) {
 		/* Don not accept empty request */
-		syslog(LOG_ERR, "Invalid zero size IO\n");
+		cas_printf(LOG_ERR, "Invalid zero size IO\n");
 		ocf_forward_end(token, -EINVAL);
 		return;
 	}
@@ -247,7 +274,7 @@ static void block_dev_forward_io(ocf_volume_t volume, ocf_forward_token_t token,
 #if 0
 	ocf_cache_t cache = ocf_volume_get_cache(volume);
 	if (ocf_cache_is_stopping(cache)) {
-		syslog(LOG_INFO, "cache is stopping, ignore io\n");
+		cas_printf(LOG_INFO, "cache is stopping, ignore io\n");
 		ocf_forward_end(token, -EINTR);
 		return;
 	}
@@ -255,7 +282,7 @@ static void block_dev_forward_io(ocf_volume_t volume, ocf_forward_token_t token,
 
 	/* io */
 	int fd = (uintptr_t)bdobj->btm_obj;
-	syslog(LOG_DEBUG, "cas io fd %d", fd);
+	cas_printf(LOG_DEBUG, "cas io fd %d, form %d", fd, ocf_volume_get_form(volume));
 	switch (dir) {
 		case OCF_READ:
 			result = xpread(fd, ptrbuf, bytes, addr);
@@ -270,37 +297,38 @@ static void block_dev_forward_io(ocf_volume_t volume, ocf_forward_token_t token,
 			break;
 
 		default:
-			syslog(LOG_ERR, "Invalid dir IO\n");
+			cas_printf(LOG_ERR, "Invalid dir IO");
 			err = -EINVAL;
 			break;
 	}
 	if (err)
-		assert(0);
+		cas_printf(LOG_ERR, "EIO:%d", errno);
 
 	ocf_forward_end(token, err);
 }
 
-static struct ocf_volume_properties btm_block_dev_properties = {
+static struct ocf_volume_properties btm_device_properties = {
 	.name = "Block_Device",
 	.volume_priv_size = sizeof(struct vb_object),
 	.caps = {
 		.atomic_writes = 0, /* Atomic writes not supported */
 	},
 	.ops = {
-		.forward_io = block_dev_forward_io,
-		.forward_flush = block_dev_forward_flush,
-		.forward_discard = block_dev_forward_discard,
-		.open = block_dev_open_object,
-		.close = block_dev_close_object,
-		.get_max_io_size = block_dev_get_max_io_size,
-		.get_length = block_dev_get_byte_length,
+		.forward_io = device_forward_io,
+		.forward_flush = device_forward_flush,
+		.forward_discard = device_forward_discard,
+		.open = device_open_object,
+		.close = device_close_object,
+		.get_max_io_size = device_get_max_io_size,
+		.get_length = device_get_byte_length,
+		.snapshot = device_snapshot,
 	},
 	.deinit = NULL,
 };
 
-struct vol_btm_driver cas_blk_driver = {
-	.properties = &btm_block_dev_properties,
-	.type = BLOCK_DEVICE_VOLUME,
+static struct vol_btm_driver btm_device_driver = {
+	.properties = &btm_device_properties,
+	.type = VOLUME_TYPE_BLOCK_DEVICE,
 };
 
-register_btm_driver(cas_blk_driver);
+register_btm_driver(btm_device_driver);

@@ -45,8 +45,8 @@
 
 #define CORE_ADD_MAX_TIMEOUT 30
 
-int is_cache_mounted(int cache_id);
-int is_core_mounted(int cache_id, int core_id);
+int is_cache_mounted(uint32_t cache_id);
+int is_core_mounted(uint32_t cache_id, int core_id);
 
 /* KCAS_IOCTL_CACHE_CHECK_DEVICE  wrapper */
 int _check_cache_device(const char *device_path,
@@ -251,6 +251,7 @@ struct name_to_val_mapping {
 static struct name_to_val_mapping cache_mode_names[] = {
 	{ .short_name = "wt", .long_name = "Write-Through", .value = ocf_cache_mode_wt },
 	{ .short_name = "wb", .long_name = "Write-Back", .value = ocf_cache_mode_wb },
+	{ .short_name = "wf", .long_name = "Write-Force", .value = ocf_cache_mode_wf },
 	{ .short_name = "wa", .long_name = "Write-Around", .value = ocf_cache_mode_wa },
 	{ .short_name = "pt", .long_name = "Pass-Through", .value = ocf_cache_mode_pt },
 #ifdef WI_AVAILABLE
@@ -631,7 +632,7 @@ int set_device_path(char *dest_path, size_t dest_len, const char *src_path, size
 	return FAILURE;
 }
 
-int get_core_info(int cache_id, int core_id,
+int get_core_info(uint32_t cache_id, int core_id,
 		  struct kcas_core_info *info, bool by_id_path)
 {
 	memset(info, 0, sizeof(*info));
@@ -646,7 +647,7 @@ int get_core_info(int cache_id, int core_id,
 		if (get_dev_path(info->core_path_name, info->core_path_name,
 				 sizeof(info->core_path_name))) {
 			cas_printf(LOG_WARNING, "WARNING: Can not resolve path to core %d "
-				   "from cache %d. By-id path will be shown for that core.\n",
+				   "from cache %"PRIu32". By-id path will be shown for that core.\n",
 				   core_id, cache_id);
 		}
 	}
@@ -654,7 +655,7 @@ int get_core_info(int cache_id, int core_id,
 	return SUCCESS;
 }
 
-static int get_core_device(int cache_id, int core_id, struct core_device *core, bool by_id_path)
+static int get_core_device(uint32_t cache_id, int core_id, struct core_device *core, bool by_id_path)
 {
 	struct kcas_core_info cmd_info;
 
@@ -687,11 +688,11 @@ int get_cache_count(void)
 	return cmd.cache_count;
 }
 
-int *get_cache_ids(int *caches_count)
+uint32_t *get_cache_ids(int *caches_count)
 {
 	int i, status;
 	struct kcas_cache_list cache_list;
-	int *cache_ids = NULL;
+	uint32_t *cache_ids = NULL;
 	int count, chunk_size;
 
 	count = get_cache_count();
@@ -749,10 +750,10 @@ error_out:
  */
 struct cache_device *get_cache_device(const struct kcas_cache_info *info, bool by_id_path)
 {
-	int core_id, cache_id, ret;
+	int core_id, ret;
 	struct cache_device *cache;
 	struct core_device core;
-	cache_id = info->cache_id;
+	uint32_t cache_id = info->cache_id;
 	size_t cache_size;
 
 	cache_size = sizeof(*cache);
@@ -808,7 +809,7 @@ struct cache_device *get_cache_device(const struct kcas_cache_info *info, bool b
  * @param cache_id cache id (1...)
  * @return valid pointer to a structure or NULL if error happened
  */
-struct cache_device *get_cache_device_by_id_fd(int cache_id, bool by_id_path)
+struct cache_device *get_cache_device_by_id_fd(uint32_t cache_id, bool by_id_path)
 {
 	struct kcas_cache_info cmd_info;
 
@@ -945,7 +946,7 @@ static int _verify_volume_path(const char *cache_device)
 	return SUCCESS;
 }
 
-static int _start_cache(uint16_t cache_id, unsigned int cache_init,
+static int _start_cache(uint32_t cache_id, unsigned int cache_init,
 		const char *cache_device, ocf_cache_mode_t cache_mode,
 		ocf_cache_line_size_t line_size, int force, bool start)
 {
@@ -1002,7 +1003,7 @@ static int _start_cache(uint16_t cache_id, unsigned int cache_init,
 
 			return FAILURE;
 		} else {
-			cas_printf(LOG_ERR, "Error inserting cache %d\n", cache_id);
+			cas_printf(LOG_ERR, "Error inserting cache %"PRIu32"\n", cache_id);
 			if (FAILURE == check_cache_already_added(cache_device)) {
 				cas_printf(LOG_ERR, "Cache device '%s' is already used as cache.\n",
 				cache_device);
@@ -1015,14 +1016,14 @@ static int _start_cache(uint16_t cache_id, unsigned int cache_init,
 
 	check_cache_state_incomplete(cache_id);
 
-	cas_printf(LOG_INFO, "Successfully %s %d\n",
+	cas_printf(LOG_INFO, "Successfully %s %"PRIu32"\n",
 			start ? "added cache instance" : "attached device to cache",
 			cache_id);
 
 	return SUCCESS;
 }
 
-int start_cache(uint16_t cache_id, unsigned int cache_init,
+int start_cache(uint32_t cache_id, unsigned int cache_init,
 		const char *cache_device, ocf_cache_mode_t cache_mode,
 		ocf_cache_line_size_t line_size, int force)
 {
@@ -1030,13 +1031,13 @@ int start_cache(uint16_t cache_id, unsigned int cache_init,
 			line_size, force, true);
 }
 
-int attach_cache(uint16_t cache_id, const char *cache_device, int force)
+int attach_cache(uint32_t cache_id, const char *cache_device, int force)
 {
 	return _start_cache(cache_id, CACHE_INIT_NEW, cache_device,
 			ocf_cache_mode_none, ocf_cache_line_size_none, force, false);
 }
 
-int detach_cache(uint16_t cache_id)
+int detach_cache(uint32_t cache_id)
 {
 	struct kcas_stop_cache cmd = {};
 	int ioctl_code = KCAS_IOCTL_DETACH_CACHE;
@@ -1057,14 +1058,14 @@ int detach_cache(uint16_t cache_id)
 		if (OCF_ERR_FLUSHING_INTERRUPTED == cmd.ext_err_code) {
 			cas_printf(LOG_ERR,
 				"You have interrupted detaching the device "
-				"from cache %d. CAS continues to operate "
+				"from cache %"PRIu32". CAS continues to operate "
 				"normally.\n",
 				cache_id
 				);
 			return INTERRUPTED;
 		} else if (OCF_ERR_WRITE_CACHE == cmd.ext_err_code) {
 			cas_printf(LOG_ERR,
-					"Detached the device from cache %d "
+					"Detached the device from cache %"PRIu32" "
 					"with errors\n",
 					cache_id
 					);
@@ -1073,7 +1074,7 @@ int detach_cache(uint16_t cache_id)
 		} else {
 			cas_printf(LOG_ERR,
 					"Error while detaching the device from"
-					" cache %d\n",
+					" cache %"PRIu32"\n",
 					cache_id
 					);
 			print_err(cmd.ext_err_code);
@@ -1081,13 +1082,13 @@ int detach_cache(uint16_t cache_id)
 		}
 	}
 
-	cas_printf(LOG_INFO, "Successfully detached device from cache %d\n",
+	cas_printf(LOG_INFO, "Successfully detached device from cache %"PRIu32"\n",
 			cache_id);
 
 	return SUCCESS;
 }
 
-int stop_cache(uint16_t cache_id, int flush)
+int stop_cache(uint32_t cache_id, int flush)
 {
 	struct kcas_stop_cache cmd = {};
 	int ioctl_code = KCAS_IOCTL_STOP_CACHE;
@@ -1111,23 +1112,39 @@ int stop_cache(uint16_t cache_id, int flush)
 	if (status < 0) {
 		if (OCF_ERR_FLUSHING_INTERRUPTED == cmd.ext_err_code) {
 			cas_printf(LOG_ERR,
-				"You have interrupted stopping of cache %d. "
+				"You have interrupted stopping of cache %"PRIu32". "
 				"CAS continues\nto operate normally. The cache"
 				" can be stopped without\nflushing dirty data "
 				"by using '-n' option.\n", cache_id);
 			return INTERRUPTED;
 		} else if (OCF_ERR_WRITE_CACHE == cmd.ext_err_code){
-			cas_printf(LOG_ERR, "Stopped cache %d with errors\n", cache_id);
+			cas_printf(LOG_ERR, "Stopped cache %"PRIu32" with errors\n", cache_id);
 			print_err(cmd.ext_err_code);
 			return FAILURE;
 		} else {
-			cas_printf(LOG_ERR, "Error while stopping cache %d\n", cache_id);
+			cas_printf(LOG_ERR, "Error while stopping cache %"PRIu32"\n", cache_id);
 			print_err(cmd.ext_err_code);
 			return FAILURE;
 		}
 	}
 
-	cas_printf(LOG_INFO, "Successfully stopped cache %d\n", cache_id);
+	cas_printf(LOG_INFO, "Successfully stopped cache %"PRIu32"\n", cache_id);
+
+	return SUCCESS;
+}
+
+int dump_inflight_of_cache(uint32_t cache_id)
+{
+	struct kcas_dump_inflight cmd;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.cache_id = cache_id;
+
+	if (run_ioctl(KCAS_IOCTL_DUMP_INFLIGHT, &cmd, sizeof(cmd)) < 0) {
+		cas_printf(LOG_ERR, "Error dump inflight cache %"PRIu32"\n", cache_id);
+		print_err(cmd.ext_err_code);
+		return FAILURE;
+	}
 
 	return SUCCESS;
 }
@@ -1139,7 +1156,7 @@ int stop_cache(uint16_t cache_id, int flush)
  * @param[out] mode mode identifier as integer
  * @return exit code of successful completion is 0; nonzero exit code means failure
  */
-int get_cache_mode(unsigned int cache_id, int *mode)
+int get_cache_mode(uint32_t cache_id, int *mode)
 {
 	struct kcas_cache_info cmd_info;
 
@@ -1158,7 +1175,7 @@ int get_cache_mode(unsigned int cache_id, int *mode)
 	return SUCCESS;
 }
 
-int set_cache_mode(unsigned int cache_mode, unsigned int cache_id, int flush)
+int set_cache_mode(unsigned int cache_mode, uint32_t cache_id, int flush)
 {
 	int orig_mode;
 	struct kcas_set_cache_state cmd;
@@ -1212,7 +1229,7 @@ int set_cache_mode(unsigned int cache_mode, unsigned int cache_id, int flush)
 			print_err(cmd.ext_err_code);
 			return FAILURE;
 		} else {
-			cas_printf(LOG_ERR, "Error while setting cache state for cache %d\n",
+			cas_printf(LOG_ERR, "Error while setting cache state for cache %"PRIu32"\n",
 				cache_id);
 			print_err(cmd.ext_err_code);
 			return FAILURE;
@@ -1235,7 +1252,7 @@ static void print_param(FILE *intermediate_file, struct cas_param *param)
 	fflush(intermediate_file);
 }
 
-int core_params_set(unsigned int cache_id, unsigned int core_id,
+int core_params_set(uint32_t cache_id, unsigned int core_id,
 		struct cas_param *params)
 {
 	int cache_mode = ocf_cache_mode_none;
@@ -1272,7 +1289,7 @@ int core_params_set(unsigned int cache_id, unsigned int core_id,
 	return SUCCESS;
 }
 
-int core_params_get(unsigned int cache_id, unsigned int core_id,
+int core_params_get(uint32_t cache_id, unsigned int core_id,
 		struct cas_param *params, unsigned int output_format)
 {
 	struct kcas_get_core_param cmd = {0};
@@ -1297,7 +1314,7 @@ int core_params_get(unsigned int cache_id, unsigned int core_id,
 
 		if (run_ioctl(KCAS_IOCTL_GET_CORE_PARAM, &cmd, sizeof(cmd)) < 0) {
 			if (cmd.ext_err_code == OCF_ERR_CACHE_NOT_EXIST)
-				cas_printf(LOG_ERR, "Cache id %d not running\n", cache_id);
+				cas_printf(LOG_ERR, "Cache id %"PRIu32" not running\n", cache_id);
 			else if (cmd.ext_err_code == OCF_ERR_CORE_NOT_AVAIL)
 				cas_printf(LOG_ERR, "Core id %d not available\n", core_id);
 			else {
@@ -1323,7 +1340,7 @@ int core_params_get(unsigned int cache_id, unsigned int core_id,
 	return SUCCESS;
 }
 
-int cache_params_set(unsigned int cache_id, struct cas_param *params)
+int cache_params_set(uint32_t cache_id, struct cas_param *params)
 {
 	int cache_mode = ocf_cache_mode_none;
 	struct kcas_set_cache_param cmd = {0};
@@ -1357,7 +1374,7 @@ int cache_params_set(unsigned int cache_id, struct cas_param *params)
 	return SUCCESS;
 }
 
-int cache_params_get(unsigned int cache_id, struct cas_param *params,
+int cache_params_get(uint32_t cache_id, struct cas_param *params,
 		unsigned int output_format)
 {
 	struct kcas_get_cache_param cmd = {0};
@@ -1381,7 +1398,7 @@ int cache_params_get(unsigned int cache_id, struct cas_param *params,
 
 		if (run_ioctl(KCAS_IOCTL_GET_CACHE_PARAM, &cmd, sizeof(cmd)) < 0) {
 			if (cmd.ext_err_code == OCF_ERR_CACHE_NOT_EXIST)
-				cas_printf(LOG_ERR, "Cache id %d not running\n", cache_id);
+				cas_printf(LOG_ERR, "Cache id %"PRIu32" not running\n", cache_id);
 			else if (cmd.ext_err_code == OCF_ERR_CACHE_STANDBY)
 				print_err(cmd.ext_err_code);
 			else
@@ -1480,11 +1497,12 @@ bool str_to_int(const char* start, char** end, int *val)
 
 
 static bool get_core_cache_id_from_string(char *str,
-	int *cache_id, int *core_id)
+	uint32_t *cache_id, int *core_id)
 {
-	char *end;
+	char *end = str;
 
-	if (!str_to_int(str, &end, cache_id))
+	*cache_id = strtoul(str, &end, 10);
+	if (end == str)
 		return false;
 
 	if (*end != '-') {
@@ -1554,11 +1572,12 @@ int get_inactive_core_count(const struct kcas_cache_info *cache_info)
  * @return 0 if check is successful and on illegal recursion is detected.
  *		1 if illegal config detected.
  */
-int illegal_recursive_core(unsigned int cache_id, const char *core_device, int core_path_size)
+int illegal_recursive_core(uint32_t cache_id, const char *core_device, int core_path_size)
 {
 	char tmp_path[MAX_STR_LEN];
 	char core_path[MAX_STR_LEN];	/* extracted actual path */
-	int dev_core_id, dev_cache_id;  /* cache_id and core_id for currently
+	int dev_core_id;
+	uint32_t dev_cache_id;  /* cache_id and core_id for currently
 					 * analyzed device */
 	struct stat st_buf;
 	int i;
@@ -1598,7 +1617,7 @@ int illegal_recursive_core(unsigned int cache_id, const char *core_device, int c
 
 		if (dev_cache_id == cache_id) {
 			cas_printf(LOG_ERR, "Core device '%s' is already cached"
-				   " on cache device %d. - "
+				   " on cache device %"PRIu32". - "
 				   "illegal multilevel caching configuration.\n",
 				   core_device, cache_id);
 			return FAILURE;
@@ -1611,7 +1630,7 @@ int illegal_recursive_core(unsigned int cache_id, const char *core_device, int c
 
 		if (!cache) {
 			cas_printf(LOG_ERR, "Failed to extract statistics for "
-				   "cache device %d\n", dev_cache_id);
+				   "cache device %"PRIu32"\n", dev_cache_id);
 			return FAILURE;
 		}
 
@@ -1630,7 +1649,7 @@ int illegal_recursive_core(unsigned int cache_id, const char *core_device, int c
 		/* make sure that loop above resulted in correct assignment */
 		if (i == cache->core_count) {
 			cas_printf(LOG_ERR, "Failed to extract statistics for "
-				   "core device %d-%d. Does it exist?\n",
+				   "core device %"PRIu32"-%d. Does it exist?\n",
 				   dev_cache_id, dev_core_id);
 			free(cache);
 			return FAILURE;
@@ -1640,7 +1659,7 @@ int illegal_recursive_core(unsigned int cache_id, const char *core_device, int c
 	}
 }
 
-int add_core(unsigned int cache_id, unsigned int core_id, const char *core_device,
+int add_core(uint32_t cache_id, unsigned int core_id, const char *core_device,
 		int try_add, int update_path)
 {
 	int fd = 0, user_core_path_size;
@@ -1654,38 +1673,48 @@ int add_core(unsigned int cache_id, unsigned int core_id, const char *core_devic
 		return FAILURE;
 	}
 
-	/* Check if core device provided is valid */
-	fd = open(core_device, 0);
-	if (fd < 0) {
-		cas_printf(LOG_ERR, "Device %s not found.\n", core_device);
-		return FAILURE;
-	}
-	close(fd);
+	if (is_block_device(core_device)) {
+		/* Check if core device provided is valid */
+		fd = open(core_device, 0);
+		if (fd < 0) {
+			cas_printf(LOG_ERR, "Device %s not found.\n", core_device);
+			return FAILURE;
+		}
+		close(fd);
 
-	/* Check if the core device is a block device or a file */
-	if (stat(core_device, &query_core)) {
-		cas_printf(LOG_ERR, "Could not stat target core device %s!\n", core_device);
-		return FAILURE;
-	}
+		/* Check if the core device is a block device or a file */
+		if (stat(core_device, &query_core)) {
+			cas_printf(LOG_ERR, "Could not stat target core device %s!\n", core_device);
+			return FAILURE;
+		}
 
-	if (!S_ISBLK(query_core.st_mode)) {
-		cas_printf(LOG_ERR, "Core object %s is not supported!\n", core_device);
-		return FAILURE;
+		if (!S_ISBLK(query_core.st_mode)) {
+			cas_printf(LOG_ERR, "Core object %s is not supported!\n", core_device);
+			return FAILURE;
+		}
 	}
 
 	memset(&cmd, 0, sizeof(cmd));
-	if (set_device_path(cmd.core_path_name, sizeof(cmd.core_path_name),
-			    core_device, MAX_STR_LEN) != SUCCESS)
-		return FAILURE;
+	if (is_block_device(core_device)) {
+		if (set_device_path(cmd.core_path_name, sizeof(cmd.core_path_name),
+					core_device, MAX_STR_LEN) != SUCCESS)
+			return FAILURE;
+	} else {
+		if (strncpy_s(cmd.core_path_name, sizeof(cmd.core_path_name), core_device, MAX_STR_LEN) != 0) {
+			return FAILURE;
+		}
+	}
 
 	user_core_path = core_device;
 	user_core_path_size = strnlen_s(core_device, MAX_STR_LEN);
 	core_path = cmd.core_path_name;
 
-	/* check for illegal recursive caching config. */
-	if (illegal_recursive_core(cache_id, user_core_path,
-		user_core_path_size)) {
-		return FAILURE;
+	if (is_block_device(core_device)) {//TODO:
+		/* check for illegal recursive caching config. */
+		if (illegal_recursive_core(cache_id, user_core_path,
+					user_core_path_size)) {
+			return FAILURE;
+		}
 	}
 
 	cmd.cache_id = cache_id;
@@ -1694,7 +1723,7 @@ int add_core(unsigned int cache_id, unsigned int core_id, const char *core_devic
 	cmd.update_path = update_path;
 
 	if (run_ioctl(KCAS_IOCTL_INSERT_CORE, &cmd, sizeof(cmd)) < 0) {
-		cas_printf(LOG_ERR, "Error while adding core device to cache instance %d\n",
+		cas_printf(LOG_ERR, "Error while adding core device to cache instance %"PRIu32"\n",
 			cache_id);
 		if (OCF_ERR_NOT_OPEN_EXC == cmd.ext_err_code) {
 			if (FAILURE == check_core_already_cached(core_path)) {
@@ -1717,13 +1746,13 @@ int add_core(unsigned int cache_id, unsigned int core_id, const char *core_devic
 	} else {
 		core_id = cmd.core_id;
 
-		cas_printf(LOG_INFO, "Successfully added core %u to cache instance %u\n", core_id, cache_id);
+		cas_printf(LOG_INFO, "Successfully added core %u to cache instance %"PRIu32"\n", core_id, cache_id);
 	}
 
 	return SUCCESS;
 }
 
-int _check_if_mounted(uint16_t cache_id, int core_id)
+int _check_if_mounted(uint32_t cache_id, int core_id)
 {
 	FILE *mtab;
 	struct mntent *mstruct;
@@ -1731,10 +1760,10 @@ int _check_if_mounted(uint16_t cache_id, int core_id)
 	int difference = 0, error = 0;
 	if (core_id >= 0) {
 		/* verify if specific core is mounted */
-		snprintf(dev_buf, sizeof(dev_buf), "/dev/cas%d-%d", cache_id, core_id);
+		snprintf(dev_buf, sizeof(dev_buf), "/dev/cas%"PRIu32"-%d", cache_id, core_id);
 	} else {
 		/* verify if any core from given cache is mounted */
-		snprintf(dev_buf, sizeof(dev_buf), "/dev/cas%d-", cache_id);
+		snprintf(dev_buf, sizeof(dev_buf), "/dev/cas%"PRIu32"-", cache_id);
 	}
 
 	mtab = setmntent("/etc/mtab", "r");
@@ -1752,11 +1781,11 @@ int _check_if_mounted(uint16_t cache_id, int core_id)
 		if (!difference) {
 			if (core_id<0) {
 				cas_printf(LOG_ERR,
-					   "Can't stop cache instance %d. Device %s is mounted!\n",
+					   "Can't stop cache instance %"PRIu32". Device %s is mounted!\n",
 					   cache_id, mstruct->mnt_fsname);
 			} else {
 				cas_printf(LOG_ERR,
-					   "Can't remove core %d from cache %d."
+					   "Can't remove core %d from cache %"PRIu32"."
 					   " Device %s is mounted!\n",
 					   core_id, cache_id, mstruct->mnt_fsname);
 			}
@@ -1767,17 +1796,17 @@ int _check_if_mounted(uint16_t cache_id, int core_id)
 
 }
 
-int is_cache_mounted(int cache_id)
+int is_cache_mounted(uint32_t cache_id)
 {
 	return _check_if_mounted(cache_id, -1);
 }
 
-int is_core_mounted(int cache_id, int core_id)
+int is_core_mounted(uint32_t cache_id, int core_id)
 {
 	return _check_if_mounted(cache_id, core_id);
 }
 
-int remove_core(unsigned int cache_id, unsigned int core_id,
+int remove_core(uint32_t cache_id, unsigned int core_id,
 		bool detach, bool force_no_flush)
 {
 	struct kcas_remove_core cmd;
@@ -1810,7 +1839,7 @@ int remove_core(unsigned int cache_id, unsigned int core_id,
 			return FAILURE;
 		} else {
 			cas_printf(LOG_ERR, "Error while %s core device %d "
-					"from cache instance %d\n",
+					"from cache instance %"PRIu32"\n",
 					detach ? "detaching" : "removing",
 					core_id, cache_id);
 			print_err(cmd.ext_err_code);
@@ -1821,7 +1850,7 @@ int remove_core(unsigned int cache_id, unsigned int core_id,
 	return SUCCESS;
 }
 
-void check_cache_state_incomplete(int cache_id)
+void check_cache_state_incomplete(uint32_t cache_id)
 {
 	struct cache_device *cache = get_cache_device_by_id_fd(cache_id, false);
 
@@ -1836,7 +1865,7 @@ void check_cache_state_incomplete(int cache_id)
 	free(cache);
 }
 
-int remove_inactive_core(unsigned int cache_id, unsigned int core_id,
+int remove_inactive_core(uint32_t cache_id, unsigned int core_id,
 		bool force)
 {
 	struct kcas_remove_inactive cmd;
@@ -1859,7 +1888,7 @@ int remove_inactive_core(unsigned int cache_id, unsigned int core_id,
 		} else {
 			cas_printf(LOG_ERR, "Error while removing inactive "
 					"core device %d from cache instance "
-					"%d\n", core_id, cache_id);
+					"%"PRIu32"\n", core_id, cache_id);
 			print_err(cmd.ext_err_code);
 		}
 		return FAILURE;
@@ -1887,7 +1916,7 @@ int core_pool_remove(const char *core_device)
 	return SUCCESS;
 }
 
-int purge_cache(unsigned int cache_id)
+int purge_cache(uint32_t cache_id)
 {
 	struct kcas_flush_cache cmd;
 
@@ -1904,7 +1933,7 @@ int purge_cache(unsigned int cache_id)
 }
 
 #define DIRTY_FLUSHING_WARNING "You have interrupted flushing of cache dirty data. CAS continues to operate\nnormally and dirty data that remains on cache device will be flushed by cleaning thread.\n"
-int flush_cache(unsigned int cache_id)
+int flush_cache(uint32_t cache_id)
 {
 	struct kcas_flush_cache cmd;
 
@@ -1925,7 +1954,7 @@ int flush_cache(unsigned int cache_id)
 	return SUCCESS;
 }
 
-int purge_core(unsigned int cache_id, unsigned int core_id)
+int purge_core(uint32_t cache_id, unsigned int core_id)
 {
 	struct kcas_flush_core cmd;
 
@@ -1944,7 +1973,7 @@ int purge_core(unsigned int cache_id, unsigned int core_id)
 	return SUCCESS;
 }
 
-int flush_core(unsigned int cache_id, unsigned int core_id)
+int flush_core(uint32_t cache_id, unsigned int core_id)
 {
 	struct kcas_flush_core cmd;
 
@@ -1999,7 +2028,7 @@ void partition_list_line(FILE *out, struct kcas_io_class *cls, bool csv)
 
 }
 
-int partition_list(unsigned int cache_id, unsigned int output_format)
+int partition_list(uint32_t cache_id, unsigned int output_format)
 {
 	struct kcas_io_class io_class = { .ext_err_code = 0 };
 	int i = 0, result = 0;
@@ -2104,7 +2133,7 @@ static inline const char *partition_get_csv_col(CSVFILE *csv, int col,
 	return val;
 }
 
-static int calculate_max_allocation(uint16_t cache_id, const char *allocation,
+static int calculate_max_allocation(uint32_t cache_id, const char *allocation,
 		uint32_t *part_size)
 {
 	float alloc = 0;
@@ -2247,7 +2276,7 @@ static int partition_parse_header(CSVFILE *csv)
 }
 
 int partition_get_config(CSVFILE *csv, struct kcas_io_classes *cnfg,
-		int cache_id)
+		uint32_t cache_id)
 {
 	int result = 0, count = 0;
 	int line = 1;
@@ -2348,7 +2377,7 @@ int partition_set_config(struct kcas_io_classes *cnfg)
 	return result;
 }
 
-int partition_setup(unsigned int cache_id, const char *file)
+int partition_setup(uint32_t cache_id, const char *file)
 {
 	int result = 0;
 	CSVFILE *in;
@@ -2398,7 +2427,7 @@ exit:
 	return result;
 }
 
-int reset_counters(unsigned int cache_id, unsigned int core_id)
+int reset_counters(uint32_t cache_id, unsigned int core_id)
 {
 	struct kcas_reset_stats cmd;
 
@@ -2461,7 +2490,7 @@ float calculate_flush_progress(unsigned dirty, unsigned flushed)
 	return total_dirty ? 100. * flushed / total_dirty : 100;
 }
 
-int get_flush_progress(int unsigned cache_id, float *progress)
+int get_flush_progress(uint32_t cache_id, float *progress)
 {
 	struct kcas_cache_info cmd_info;
 
@@ -2852,7 +2881,7 @@ int zero_md(const char *cache_device, bool force)
 	return SUCCESS;
 }
 
-int standby_init(int cache_id, ocf_cache_line_size_t line_size,
+int standby_init(uint32_t cache_id, ocf_cache_line_size_t line_size,
 		const char *cache_device, int force)
 {
 	return start_cache(cache_id,
@@ -2863,7 +2892,7 @@ int standby_init(int cache_id, ocf_cache_line_size_t line_size,
 			force);
 }
 
-int standby_load(int cache_id, ocf_cache_line_size_t line_size,
+int standby_load(uint32_t cache_id, ocf_cache_line_size_t line_size,
 		const char *cache_device)
 {
 	return start_cache(cache_id,
@@ -2874,7 +2903,7 @@ int standby_load(int cache_id, ocf_cache_line_size_t line_size,
 			0);
 }
 
-int standby_detach(int cache_id)
+int standby_detach(uint32_t cache_id)
 {
 	struct kcas_standby_detach cmd = {
 		.cache_id = cache_id
@@ -2885,13 +2914,13 @@ int standby_detach(int cache_id)
 		return FAILURE;
 	}
 
-	cas_printf(LOG_INFO, "Successfully detached cache instance %hu\n",
+	cas_printf(LOG_INFO, "Successfully detached cache instance %"PRIu32"\n",
 			cache_id);
 
 	return SUCCESS;
 }
 
-int standby_activate(int cache_id, const char *cache_device)
+int standby_activate(uint32_t cache_id, const char *cache_device)
 {
 	struct kcas_standby_activate cmd = {
 		.cache_id = cache_id
@@ -2903,7 +2932,7 @@ int standby_activate(int cache_id, const char *cache_device)
 	}
 
 	if (run_ioctl(KCAS_IOCTL_STANDBY_ACTIVATE, &cmd, sizeof(cmd)) < 0) {
-		cas_printf(LOG_ERR, "Error activating cache %d\n", cache_id);
+		cas_printf(LOG_ERR, "Error activating cache %"PRIu32"\n", cache_id);
 		if (abs(cmd.ext_err_code) == OCF_ERR_NOT_OPEN_EXC) {
 			cas_printf(LOG_ERR, "Cannot open the device exclusively. Make sure "
 					"to detach cache before activation.\n");
@@ -2915,7 +2944,7 @@ int standby_activate(int cache_id, const char *cache_device)
 
 	check_cache_state_incomplete(cache_id);
 
-	cas_printf(LOG_INFO, "Successfully activated cache instance %hu\n",
+	cas_printf(LOG_INFO, "Successfully activated cache instance %"PRIu32"\n",
 			cache_id);
 
 	return SUCCESS;

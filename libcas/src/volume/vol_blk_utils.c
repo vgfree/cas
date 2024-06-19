@@ -8,7 +8,6 @@
 #include "../cas_cache.h"
 
 
-//LIST_HEAD(g_vol_btm_drivers);
 struct list_head g_vol_btm_drivers = {
 	.prev = &g_vol_btm_drivers,
 	.next = &g_vol_btm_drivers,
@@ -55,16 +54,18 @@ int load_btm_driver(void)
 
 int cas_blk_identify_type(const char *path, uint8_t *type)
 {
+	if (strncmp(path, "sagocycas", 9) == 0) {
+		*type = VOLUME_TYPE_BLOCK_SAGOCYCAS;
+		return 0;
+	}
+
 	struct stat st;
 	int result = stat(path, &st);
-	if (result < 0)
-		return -OCF_ERR_INVAL_VOLUME_TYPE;
+	if ((result == 0) && S_ISBLK(st.st_mode)) {
+		*type = VOLUME_TYPE_BLOCK_DEVICE;
+		return 0;
+	}
 
-	if (S_ISBLK(st.st_mode))
-		*type = BLOCK_DEVICE_VOLUME;
-	else
-		return -OCF_ERR_INVAL_VOLUME_TYPE;
-
-	return 0;
+	return -OCF_ERR_INVAL_VOLUME_TYPE;
 }
 

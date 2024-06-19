@@ -71,14 +71,7 @@ OBJS += safeclib/strnlen_s.o
 #
 CFLAGS     = $(patsubst %,-I%,$(INCLUDES))
 CFLAGS    += $(patsubst %,-D%,$(DEFINES))
-ifdef DEBUG
 CFLAGS    += -O0 -g
-else
-CFLAGS    += -O2 -D_FORTIFY_SOURCE=2
-endif
-ifdef DEBUG_PACKAGE
-CFLAGS    += -g3
-endif
 CFLAGS    += -Wall -Werror -z relro -z now -fstack-protector -fPIC -Wformat -Wformat-security -fno-strict-aliasing
 
 #
@@ -107,9 +100,9 @@ $(TARGET): $(TARGET).a
 $(TARGET).a: $(patsubst %,$(OBJDIR)%,$(OBJS))
 	@echo "  AR " $@
 	@ar rcs $@ $^
-	@echo "  AR " libcas.a
-	@cp -f $@ libcas.a
-	@ar d libcas.a $(OBJDIR)argp.o $(OBJDIR)cas_main.c
+	@echo "  AR " libcascli.a
+	@cp -f $@ libcascli.a
+	@ar d libcascli.a $(OBJDIR)argp.o $(OBJDIR)cas_main.c
 
 #
 # Generic target for C file
