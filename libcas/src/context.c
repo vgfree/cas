@@ -37,8 +37,7 @@ ctx_data_t *cas_ctx_data_alloc(uint32_t pages)
 		return NULL;
 	}
 	data->my_vec.iov_len = pages * PAGE_SIZE;
-	//data->my_vec.iov_base = env_valloc(pages * PAGE_SIZE, 0);
-	data->my_vec.iov_base = xvalloc(pages * PAGE_SIZE);
+	data->my_vec.iov_base = env_malloc(pages * PAGE_SIZE, 0);
 	if (!data->my_vec.iov_base) {
 		env_free(data);
 		syslog(LOG_ERR, "Couldn't allocate my_vec.\n");

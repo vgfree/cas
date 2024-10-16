@@ -101,7 +101,7 @@ static int cas_disk_open(struct vb_object *dsk, const char *path, void *private)
 		goto error_strdup;
 	}
 
-	int fd = open(path, O_RDWR | O_DIRECT);
+	int fd = open(path, O_RDWR);
 	if (fd < 0) {
 		syslog(LOG_ERR, "Cannot open %s", path);
 		goto error_open_bdev;
@@ -184,90 +184,88 @@ static uint64_t block_dev_get_byte_length(ocf_volume_t vol)
 	return size;
 }
 
-/*
- *
- */
-static void cas_bd_io_end(struct ocf_io *io, int error)
+static void block_dev_forward_flush(ocf_volume_t volume, ocf_forward_token_t token)
 {
-	struct vb_io *vbio = cas_io_to_blkio(io);
+	struct vb_object *bdobj = cas_volume_get_vb_object(volume);
+	struct cas_data *data = ocf_forward_get_data(token);
 
-	if (error)
-		vbio->error |= error;
-
-	if (env_atomic_dec_return(&vbio->rq_remaning))
+#if 0
+	ocf_cache_t cache = ocf_volume_get_cache(volume);
+	if (ocf_cache_is_stopping(cache)) {
+		syslog(LOG_INFO, "cache is stopping, ignore io\n");
+		ocf_forward_end(token, -EINTR);
 		return;
-
-	CAS_DEBUG_MSG("Completion");
-
-	/* Send completion to caller */
-	io->end(io, vbio->error);
-}
-
-
-static void block_dev_submit_flush(struct ocf_io *io)
-{
-	struct vb_io *blkio = cas_io_to_blkio(io);
-	struct vb_object *bdobj = cas_volume_get_vb_object(ocf_io_get_volume(io));
-
-	/* Prevent races of completing IO */
-	env_atomic_set(&blkio->rq_remaning, 1);
-
+	}
+#endif
 	int fd = (uintptr_t)bdobj->btm_obj;
 	int err = fsync(fd);
-	cas_bd_io_end(io, err);
+	ocf_forward_end(token, err);
 }
 
-static void block_dev_submit_discard(struct ocf_io *io)
+static void block_dev_forward_discard(ocf_volume_t volume, ocf_forward_token_t token,
+		uint64_t addr, uint64_t bytes)
 {
-	struct vb_io *blkio = cas_io_to_blkio(io);
+	struct vb_object *bdobj = cas_volume_get_vb_object(volume);
+	struct cas_data *data = ocf_forward_get_data(token);
 
-	//sector_t start = io->addr >> SECTOR_SHIFT;
-
-	/* Prevent races of completing IO */
-	env_atomic_set(&blkio->rq_remaning, 1);
+#if 0
+	ocf_cache_t cache = ocf_volume_get_cache(volume);
+	if (ocf_cache_is_stopping(cache)) {
+		syslog(LOG_INFO, "cache is stopping, ignore io\n");
+		ocf_forward_end(token, -EINTR);
+		return;
+	}
+#endif
 	//TODO
-
-	cas_bd_io_end(io, blkio->error);
+	ocf_forward_end(token, 0);
 }
 
 /*
  *
  */
-static void block_dev_submit_io(struct ocf_io *io)
+static void block_dev_forward_io(ocf_volume_t volume, ocf_forward_token_t token,
+		int dir, uint64_t addr, uint64_t bytes, uint64_t offset)
 {
-	struct vb_io *vbio = cas_io_to_blkio(io);
-	struct cas_data *data = vbio->data;
-	struct vb_object *bdobj = cas_volume_get_vb_object(ocf_io_get_volume(io));
+	struct vb_object *bdobj = cas_volume_get_vb_object(volume);
+	struct cas_data *data = ocf_forward_get_data(token);
+	uint64_t flags = ocf_forward_get_flags(token);
 	int err = 0;
-	int bytes = 0;
+	int result = 0;
+	void *ptrbuf = data->io_vec.iov_base + offset;
 
-	CAS_DEBUG_PARAM("Address = %llu, bytes = %u\n", io->addr, io->bytes);
+	CAS_DEBUG_PARAM("Address = %llu, bytes = %u\n", addr, bytes);
 
-	/* Prevent races of completing IO */
-	env_atomic_set(&vbio->rq_remaning, 1);
-
-	if (!io->bytes) {
+	if (!bytes) {
 		/* Don not accept empty request */
 		syslog(LOG_ERR, "Invalid zero size IO\n");
-		cas_bd_io_end(io, -EINVAL);
+		ocf_forward_end(token, -EINVAL);
 		return;
 	}
 
-	assert(vbio->data_offset < data->io_vec.iov_len);
+	assert(offset < data->io_vec.iov_len);
+
+#if 0
+	ocf_cache_t cache = ocf_volume_get_cache(volume);
+	if (ocf_cache_is_stopping(cache)) {
+		syslog(LOG_INFO, "cache is stopping, ignore io\n");
+		ocf_forward_end(token, -EINTR);
+		return;
+	}
+#endif
+
 	/* io */
 	int fd = (uintptr_t)bdobj->btm_obj;
-	switch (io->dir) {
+	syslog(LOG_DEBUG, "cas io fd %d", fd);
+	switch (dir) {
 		case OCF_READ:
-			//bytes = xpread(fd, data->io_vec.iov_base + data->io_offset + vbio->data_offset, io->bytes, io->addr);
-			bytes = xpread(fd, data->io_vec.iov_base + vbio->data_offset, io->bytes, io->addr);
-			if (bytes != io->bytes)
+			result = xpread(fd, ptrbuf, bytes, addr);
+			if (result != bytes)
 				err = -EIO;
 			break;
 
 		case OCF_WRITE:
-			//bytes = xpwrite(fd, data->io_vec.iov_base + data->io_offset + vbio->data_offset, io->bytes, io->addr);
-			bytes = xpwrite(fd, data->io_vec.iov_base + vbio->data_offset, io->bytes, io->addr);
-			if (bytes != io->bytes)
+			result = xpwrite(fd, ptrbuf, bytes, addr);
+			if (result != bytes)
 				err = -EIO;
 			break;
 
@@ -279,59 +277,29 @@ static void block_dev_submit_io(struct ocf_io *io)
 	if (err)
 		assert(0);
 
-	cas_bd_io_end(io, err);
+	ocf_forward_end(token, err);
 }
 
-/*
- *
- */
-int cas_blk_io_set_data(struct ocf_io *io,
-		ctx_data_t *ctx_data, uint32_t offset)
-{
-	struct vb_io *blkio = cas_io_to_blkio(io);
-
-	blkio->data = ctx_data;
-	blkio->data_offset = offset;
-	return 0;
-}
-
-/*
- *
- */
-ctx_data_t *cas_blk_io_get_data(struct ocf_io *io)
-{
-	struct vb_io *blkio = cas_io_to_blkio(io);
-
-	return blkio->data;
-}
-
-
-struct ocf_volume_properties cas_object_blk_properties = {
+static struct ocf_volume_properties btm_block_dev_properties = {
 	.name = "Block_Device",
-	.io_priv_size = sizeof(struct vb_io),
 	.volume_priv_size = sizeof(struct vb_object),
 	.caps = {
 		.atomic_writes = 0, /* Atomic writes not supported */
 	},
 	.ops = {
-		.submit_io = block_dev_submit_io,
-		.submit_flush = block_dev_submit_flush,
-		.submit_metadata = NULL,
-		.submit_discard = block_dev_submit_discard,
+		.forward_io = block_dev_forward_io,
+		.forward_flush = block_dev_forward_flush,
+		.forward_discard = block_dev_forward_discard,
 		.open = block_dev_open_object,
 		.close = block_dev_close_object,
 		.get_max_io_size = block_dev_get_max_io_size,
 		.get_length = block_dev_get_byte_length,
 	},
-	.io_ops = {
-		.set_data = cas_blk_io_set_data,
-		.get_data = cas_blk_io_get_data,
-	},
 	.deinit = NULL,
 };
 
 struct vol_btm_driver cas_blk_driver = {
-	.properties = &cas_object_blk_properties,
+	.properties = &btm_block_dev_properties,
 	.type = BLOCK_DEVICE_VOLUME,
 };
 

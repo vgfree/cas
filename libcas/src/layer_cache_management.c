@@ -1087,6 +1087,9 @@ int cache_mngt_core_pool_get_paths(struct kcas_core_pool_path *cmd_info)
 	struct get_paths_ctx visitor_ctx = {0};
 	int result;
 
+	if (cmd_info->core_path_tab == NULL)
+		return -EINVAL;
+
 	visitor_ctx.core_path_name_tab = cmd_info->core_path_tab;
 	visitor_ctx.max_count = cmd_info->core_pool_count;
 
@@ -1302,7 +1305,10 @@ static int cache_mngt_update_core_uuid(ocf_cache_t cache, const char *core_name,
 	if (result)
 		return result;
 
-	return _cache_mngt_save_sync(cache);
+	if (ocf_cache_is_device_attached(cache))
+		result = _cache_mngt_save_sync(cache);
+
+	return result;
 }
 
 static void _cache_mngt_log_core_device_path(ocf_core_t core)
@@ -1748,7 +1754,12 @@ int cache_mngt_set_partitions(const char *cache_name, size_t name_len,
 
 	if (ocf_cache_is_standby(cache)) {
 		result = -OCF_ERR_CACHE_STANDBY;
-		goto out_standby;
+		goto out_not_running;
+	}
+
+	if (!ocf_cache_is_device_attached(cache)) {
+		result = -OCF_ERR_CACHE_DETACHED;
+		goto out_not_running;
 	}
 
 	for (class_id = 0; class_id < OCF_USER_IO_CLASS_MAX; class_id++) {
@@ -1783,7 +1794,7 @@ out_cls:
 		while (class_id--)
 			cas_cls_rule_destroy(cache, cls_rule[class_id]);
 	}
-out_standby:
+out_not_running:
 	ocf_mngt_cache_put(cache);
 out_get:
 	env_free(io_class_cfg);
@@ -1879,6 +1890,39 @@ static int cache_mngt_create_cache_device_cfg(
 	return 0;
 }
 
+int cache_mngt_attach_cache_cfg(char *cache_name, size_t name_len,
+		struct ocf_mngt_cache_config *cfg,
+		struct ocf_mngt_cache_attach_config *attach_cfg,
+		struct kcas_start_cache *cmd)
+{
+	int result;
+
+	if (!cmd)
+		return -OCF_ERR_INVAL;
+
+	memset(cfg, 0, sizeof(*cfg));
+	memset(attach_cfg, 0, sizeof(*attach_cfg));
+
+	result = cache_mngt_create_cache_device_cfg(&attach_cfg->device,
+			cmd->cache_path_name);
+	if (result)
+		return result;
+
+	//TODO maybe attach should allow to change cache line size?
+	//cfg->cache_line_size = cmd->line_size;
+	cfg->use_submit_io_fast = !use_io_scheduler;
+	cfg->locked = true;
+	cfg->metadata_volatile = true;
+
+	cfg->backfill.max_queue_size = max_writeback_queue_size;
+	cfg->backfill.queue_unblock_size = writeback_queue_unblock_size;
+	attach_cfg->cache_line_size = cmd->line_size;
+	attach_cfg->force = cmd->force;
+	attach_cfg->discard_on_start = true;
+
+	return 0;
+}
+
 static void cache_mngt_destroy_cache_device_cfg(
 		struct ocf_mngt_cache_device_config *cfg)
 {
@@ -1892,6 +1936,15 @@ int cache_mngt_create_cache_cfg(struct ocf_mngt_cache_config *cfg,
 	int init_cache, result;
 	char cache_name[OCF_CACHE_NAME_SIZE];
 	uint16_t cache_id;
+
+	switch (cmd->init_cache) {
+		case CACHE_INIT_STANDBY_NEW:
+		case CACHE_INIT_STANDBY_LOAD:
+			syslog(LOG_ERR, "Standby mode is not supported!\n");
+			return -ENOTSUP;
+		default:
+			break;
+	}
 
 	if (!cmd)
 		return -OCF_ERR_INVAL;
@@ -1987,18 +2040,16 @@ const struct ocf_queue_ops queue_ops = {
 	.stop = _cas_queue_stop,
 };
 
-int cas_init_mngt_queue_thread(ocf_queue_t q)
+int cas_init_mngt_queue_thread(ocf_cache_t cache, ocf_queue_t q)
 {
-	ocf_cache_t cache = ocf_queue_get_cache(q);
 	const char *cache_num = ocf_cache_get_name(cache) + 5;
 	char name[48] = {};
 	snprintf(name, sizeof(name), "cas_mngt_%s", cache_num);
 
 	return queue_thread_init(q, name);
 }
-int cas_init_io_queue_thread(ocf_queue_t q)
+int cas_init_io_queue_thread(ocf_cache_t cache, ocf_queue_t q)
 {
-	ocf_cache_t cache = ocf_queue_get_cache(q);
 	const char *cache_num = ocf_cache_get_name(cache) + 5;
 	char name[48] = {};
 	snprintf(name, sizeof(name), "cas_io_%s", cache_num);
@@ -2019,24 +2070,22 @@ static int _cache_mngt_start_queues(ocf_cache_t cache)
 		if (result)
 			goto err;
 
-		result = cas_init_io_queue_thread(cache_priv->io_queues[i]);
+		result = cas_init_io_queue_thread(cache, cache_priv->io_queues[i]);
 		if (result) {
 			ocf_queue_put(cache_priv->io_queues[i]);
 			goto err;
 		}
 	}
 
-	result = ocf_queue_create(cache, &cache_priv->mngt_queue, &queue_ops);
+	result = ocf_queue_create_mngt(cache, &cache_priv->mngt_queue, &queue_ops);
 	if (result)
 		goto err;
 
-	result = cas_init_mngt_queue_thread(cache_priv->mngt_queue);
+	result = cas_init_mngt_queue_thread(cache, cache_priv->mngt_queue);
 	if (result) {
 		ocf_queue_put(cache_priv->mngt_queue);
 		goto err;
 	}
-
-	ocf_mngt_cache_set_mngt_queue(cache, cache_priv->mngt_queue);
 
 	return 0;
 err:
@@ -2064,27 +2113,68 @@ static void init_instance_complete(struct _cache_mngt_attach_context *ctx,
 
 }
 
+static void calculate_min_ram_size(ocf_cache_t cache,
+		struct _cache_mngt_attach_context *ctx)
+{
+	uint64_t volume_size;
+	int result;
+
+	ctx->min_free_ram = 0;
+
+	result = cache_mngt_create_cache_device_cfg(&ctx->device_cfg,
+			ctx->cache_path);
+	if (result)
+			goto end;
+
+	result = ocf_volume_open(ctx->device_cfg.volume,
+			ctx->device_cfg.volume_params);
+	if (result)
+		goto destroy_config;
+
+	volume_size = ocf_volume_get_length(ctx->device_cfg.volume);
+	ctx->min_free_ram = ocf_mngt_get_ram_needed(cache, volume_size);
+	ocf_volume_close(ctx->device_cfg.volume);
+
+destroy_config:
+	cache_mngt_destroy_cache_device_cfg(&ctx->device_cfg);
+end:
+	if (result)
+		syslog(LOG_WARNING, "Cannot calculate amount of DRAM needed\n");
+}
+
+static void _cache_mngt_attach_complete(ocf_cache_t cache, void *priv,
+		int error)
+{
+	struct _cache_mngt_attach_context *ctx = priv;
+	int caller_status;
+	char *path;
+
+	cache_mngt_destroy_cache_device_cfg(&ctx->device_cfg);
+
+	if (!error) {
+		path = (char *)ocf_volume_get_uuid(ocf_cache_get_volume(
+					cache))->data;
+		syslog(LOG_INFO, "Succsessfully attached %s\n", path);
+	}
+
+	caller_status = _cache_mngt_async_callee_set_result(&ctx->async, error);
+	if (caller_status != -KCAS_ERR_WAITING_INTERRUPTED)
+		return;
+
+	env_free(ctx);
+	ocf_mngt_cache_unlock(cache);
+	ocf_mngt_cache_put(cache);
+}
+
 static void _cache_mngt_start_complete(ocf_cache_t cache, void *priv, int error)
 {
 	struct _cache_mngt_attach_context *ctx = priv;
 	int caller_status;
-	int result;
 
 	cache_mngt_destroy_cache_device_cfg(&ctx->device_cfg);
 
-	if (error == -OCF_ERR_NO_FREE_RAM) {
-		result = cache_mngt_create_cache_device_cfg(&ctx->device_cfg,
-				ctx->cache_path);
-		if (result) {
-			syslog(LOG_WARNING, "Cannot calculate amount of DRAM "
-					"needed\n");
-			ctx->min_free_ram = 0;
-		} else {
-			ocf_mngt_get_ram_needed(cache, &ctx->device_cfg,
-					&ctx->min_free_ram);
-			cache_mngt_destroy_cache_device_cfg(&ctx->device_cfg);
-		}
-	}
+	if (error == -OCF_ERR_NO_FREE_RAM)
+		calculate_min_ram_size(cache, ctx);
 
 	caller_status =_cache_mngt_async_callee_set_result(&ctx->async, error);
 	if (caller_status == -KCAS_ERR_WAITING_INTERRUPTED) {
@@ -2191,6 +2281,14 @@ static int _cache_mngt_probe_metadata(char *cache_path_name,
 	return result;
 }
 
+static void volume_set_no_merges_flag_helper(ocf_cache_t cache)
+{
+}
+
+static void _cache_save_device_properties(ocf_cache_t cache)
+{
+}
+
 static int _cache_start_finalize(ocf_cache_t cache, int init_mode,
 		bool activate)
 {
@@ -2208,6 +2306,10 @@ static int _cache_start_finalize(ocf_cache_t cache, int init_mode,
 			return result;
 		}
 		ctx->cls_inited = true;
+
+		volume_set_no_merges_flag_helper(cache);
+
+		_cache_save_device_properties(cache);
 	}
 
 	if (activate)
@@ -2248,28 +2350,74 @@ static int _cache_start_finalize(ocf_cache_t cache, int init_mode,
 
 #if 0
 static int cache_mngt_check_bdev(struct ocf_mngt_cache_device_config *cfg,
-		bool force)
+		bool force, bool reattach, ocf_cache_t cache)
 {
 	char holder[] = "CAS START\n";
+	cas_bdev_handle_t bdev_handle;
 	struct block_device *bdev;
 	int part_count;
 	bool is_part;
+	bool reattach_properties_diff = false;
+	struct cache_priv *cache_priv;
 	const struct ocf_volume_uuid *uuid = ocf_volume_get_uuid(cfg->volume);
+	/* The only reason to use blk_stack_limits() is checking compatibility of
+	 * the new device with the original cache. But since the functions modifies
+	 * content of queue_limits, we use copy of the original struct.
+	 */
+	struct queue_limits tmp_limits;
 
-	bdev = blkdev_get_by_path(uuid->data,
-			(FMODE_EXCL|FMODE_READ), holder);
-	if (IS_ERR(bdev)) {
-		return (PTR_ERR(bdev) == -EBUSY) ?
+	bdev_handle = cas_bdev_open_by_path(uuid->data,
+			(CAS_BLK_MODE_EXCL | CAS_BLK_MODE_READ), holder);
+	if (IS_ERR(bdev_handle)) {
+		return (PTR_ERR(bdev_handle) == -EBUSY) ?
 				-OCF_ERR_NOT_OPEN_EXC :
 				-OCF_ERR_INVAL_VOLUME_TYPE;
 	}
+	bdev = cas_bdev_get_from_handle(bdev_handle);
 
 	is_part = (cas_bdev_whole(bdev) != bdev);
 	part_count = cas_blk_get_part_count(bdev);
-	blkdev_put(bdev, (FMODE_EXCL|FMODE_READ));
+
+	if (reattach) {
+		ENV_BUG_ON(!cache);
+
+		cache_priv = ocf_cache_get_priv(cache);
+		tmp_limits = cache_priv->device_properties.queue_limits;
+
+		if (blk_stack_limits(&tmp_limits, &bdev->bd_disk->queue->limits, 0)) {
+			reattach_properties_diff = true;
+			syslog(LOG_WARNING, "New cache device block properties "
+					"differ from the previous one.\n");
+		}
+		if (tmp_limits.misaligned) {
+			reattach_properties_diff = true;
+			syslog(LOG_WARNING, "New cache device block interval "
+					"doesn't line up with the previous one.\n");
+		}
+		if (CAS_CHECK_QUEUE_FLUSH(bdev->bd_disk->queue) !=
+				cache_priv->device_properties.flush) {
+			reattach_properties_diff = true;
+			syslog(LOG_WARNING, "New cache device %s support flush "
+					"in contrary to the previous cache device.\n",
+					cache_priv->device_properties.flush ? "doesn't" : "does");
+		}
+		if (CAS_CHECK_QUEUE_FUA(bdev->bd_disk->queue) !=
+				cache_priv->device_properties.fua) {
+			reattach_properties_diff = true;
+			syslog(LOG_WARNING, "New cache device %s support fua "
+					"in contrary to the previous cache device.\n",
+					cache_priv->device_properties.fua ? "doesn't" : "does");
+		}
+	}
+
+	cas_bdev_release(bdev_handle,
+			(CAS_BLK_MODE_EXCL | CAS_BLK_MODE_READ), holder);
 
 	if (!is_part && part_count > 1 && !force)
 		return -KCAS_ERR_CONTAINS_PART;
+
+	if (reattach_properties_diff)
+		return -KCAS_ERR_DEVICE_PROPERTIES_MISMATCH;
 
 	return 0;
 }
@@ -2345,6 +2493,78 @@ int cache_mngt_create_cache_standby_activate_cfg(
 	return 0;
 }
 
+static void _cache_mngt_detach_cache_complete(ocf_cache_t cache, void *priv,
+		int error)
+{
+	struct _cache_mngt_async_context *context = priv;
+	int result;
+
+	result = _cache_mngt_async_callee_set_result(context, error);
+
+	if (result != -KCAS_ERR_WAITING_INTERRUPTED)
+		return;
+
+	ocf_mngt_cache_unlock(cache);
+	env_free(context);
+}
+
+int cache_mngt_attach_device(const char *cache_name, size_t name_len,
+		const char *device, struct ocf_mngt_cache_attach_config *attach_cfg)
+{
+	struct _cache_mngt_attach_context *context;
+	ocf_cache_t cache;
+	int result = 0;
+
+	result = ocf_mngt_cache_get_by_name(cas_ctx, cache_name,
+			OCF_CACHE_NAME_SIZE, &cache);
+	if (result) {
+		ocf_volume_destroy(attach_cfg->device.volume);
+		goto err_get;
+	}
+
+	result = _cache_mngt_lock_sync(cache);
+	if (result) {
+		ocf_volume_destroy(attach_cfg->device.volume);
+		goto err_lock;
+	}
+
+	//result = cache_mngt_check_bdev(&attach_cfg->device,
+	//		attach_cfg->force, true, cache);
+	//if (result) {
+	//	ocf_volume_destroy(attach_cfg->device.volume);
+	//	goto err_ctx;
+	//}
+
+	context = env_zalloc(sizeof(*context), 0);
+	if (!context) {
+		ocf_volume_destroy(attach_cfg->device.volume);
+		result = -ENOMEM;
+		goto err_ctx;
+	}
+
+	context->device_cfg = attach_cfg->device;
+
+	_cache_mngt_async_context_init(&context->async);
+
+	ocf_mngt_cache_attach(cache, attach_cfg, _cache_mngt_attach_complete,
+			context);
+	result = env_completion_wait_interruptible(&context->async.cmpl);
+
+	result = _cache_mngt_async_caller_set_result(&context->async, result);
+	if (result == -KCAS_ERR_WAITING_INTERRUPTED)
+		goto err_get;
+
+	volume_set_no_merges_flag_helper(cache);
+
+	env_free(context);
+err_ctx:
+	ocf_mngt_cache_unlock(cache);
+err_lock:
+	ocf_mngt_cache_put(cache);
+err_get:
+	return result;
+}
+
 int cache_mngt_activate(struct ocf_mngt_cache_standby_activate_config *cfg,
 		struct kcas_standby_activate *cmd)
 {
@@ -2376,7 +2596,7 @@ int cache_mngt_activate(struct ocf_mngt_cache_standby_activate_config *cfg,
 	 * to compare data on drive and in DRAM to provide more specific
 	 * error code.
 	 */
-	//result = cache_mngt_check_bdev(&cfg->device, true);
+	//result = cache_mngt_check_bdev(&cfg->device, true, false, NULL);
 	//if (result)
 	//	goto out_cache_unlock;
 
@@ -2460,12 +2680,17 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 	ocf_cache_line_size_t cache_line_size_meta;
 
 	switch (cmd->init_cache) {
+		case CACHE_INIT_STANDBY_NEW:
+		case CACHE_INIT_STANDBY_LOAD:
+			ocf_volume_destroy(attach_cfg->device.volume);
+			syslog(LOG_ERR, "Standby mode is not supported!\n");
+			return -ENOTSUP;
 	case CACHE_INIT_LOAD:
-	case CACHE_INIT_STANDBY_LOAD:
 		result = _cache_mngt_probe_metadata(cmd->cache_path_name,
 				cache_name_meta, &cache_mode_meta,
 				&cache_line_size_meta);
 		if (result) {
+			ocf_volume_destroy(attach_cfg->device.volume);
 			return result;
 		}
 
@@ -2475,6 +2700,7 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 			syslog(LOG_ERR, "Improper cache name format on %s.\n",
 					cmd->cache_path_name);
 
+			ocf_volume_destroy(attach_cfg->device.volume);
 			return -OCF_ERR_START_CACHE_FAIL;
 		}
 
@@ -2486,6 +2712,7 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 					"already exists.\n", cache_name_meta);
 
 			ocf_mngt_cache_put(tmp_cache);
+			ocf_volume_destroy(attach_cfg->device.volume);
 			return -OCF_ERR_CACHE_EXIST;
 		}
 
@@ -2500,6 +2727,7 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 
 	context = env_zalloc(sizeof(*context), 0);
 	if (!context) {
+		ocf_volume_destroy(attach_cfg->device.volume);
 		return -ENOMEM;
 	}
 
@@ -2508,6 +2736,7 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 	if (!context->rollback_thread) {
 		result = -errno;
 		env_free(context);
+		ocf_volume_destroy(attach_cfg->device.volume);
 		return result;
 	}
 
@@ -2522,18 +2751,19 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 	if (result) {
 		cas_lazy_thread_stop(context->rollback_thread);
 		env_free(context);
+		ocf_volume_destroy(attach_cfg->device.volume);
 		return result;
 	}
 	context->cache = cache;
 
 	result = _cache_mngt_cache_priv_init(cache);
 	if (result)
-		goto err;
+		goto err_deinit_config;
 	context->priv_inited = true;
 
 	result = _cache_mngt_start_queues(cache);
 	if (result)
-		goto err;
+		goto err_deinit_config;
 
 	cache_priv = ocf_cache_get_priv(cache);
 	cache_priv->attach_context = context;
@@ -2580,6 +2810,9 @@ int cache_mngt_init_instance(struct ocf_mngt_cache_config *cfg,
 	ocf_mngt_cache_unlock(cache);
 
 	return result;
+
+err_deinit_config:
+	ocf_volume_destroy(attach_cfg->device.volume);
 err:
 	cmd->min_free_ram = context->min_free_ram;
 
@@ -2677,7 +2910,7 @@ out:
  * nonzero exit code means failure
  */
 
-int cache_mngt_set_seq_cutoff_promotion_count(ocf_cache_t cache,
+static int cache_mngt_set_seq_cutoff_promotion_count(ocf_cache_t cache,
 		ocf_core_t core, uint32_t count)
 {
 	int result;
@@ -2819,6 +3052,11 @@ int cache_mngt_set_cache_mode(const char *cache_name, size_t name_len,
 		goto put;
 	}
 
+	if (!ocf_cache_is_device_attached(cache)) {
+		result = -OCF_ERR_CACHE_DETACHED;
+		goto put;
+	}
+
 	old_mode = ocf_cache_get_mode(cache);
 	if (old_mode == mode) {
 		syslog(LOG_INFO, "%s is in requested cache mode already\n", cache_name);
@@ -2866,6 +3104,53 @@ put:
 	return result;
 }
 
+int cache_mngt_detach_cache(const char *cache_name, size_t name_len)
+{
+	ocf_cache_t cache;
+	int status = 0;
+	struct _cache_mngt_async_context *context;
+
+	context = env_malloc(sizeof(*context), 0);
+	if (!context)
+		return -ENOMEM;
+
+	_cache_mngt_async_context_init(context);
+
+	status = ocf_mngt_cache_get_by_name(cas_ctx, cache_name,
+					name_len, &cache);
+	if (status)
+		goto err_get_cache;
+
+	if (ocf_cache_is_running(cache))
+		status = _cache_flush_with_lock(cache);
+	if (status)
+		goto err_flush;
+
+	status = _cache_mngt_lock_sync(cache);
+	if (status)
+		goto err_lock;
+
+	ocf_mngt_cache_detach(cache, _cache_mngt_detach_cache_complete, context);
+
+	status = env_completion_wait_interruptible(&context->cmpl);
+	status = _cache_mngt_async_caller_set_result(context, status);
+
+	if (status == -KCAS_ERR_WAITING_INTERRUPTED) {
+		syslog(LOG_WARNING, "Waiting for cache detach interrupted. "
+				"The operation will finish asynchronously.\n");
+		goto err_int;
+	}
+
+	ocf_mngt_cache_unlock(cache);
+err_lock:
+err_flush:
+	ocf_mngt_cache_put(cache);
+err_get_cache:
+	env_free(context);
+err_int:
+	return status;
+}
+
 /**
  * @brief routine implements --stop-cache command.
  * @param[in] cache_name caching device name to be removed
@@ -2886,10 +3171,6 @@ int cache_mngt_exit_instance(const char *cache_name, size_t name_len, int flush)
 	if (status)
 		return status;
 
-	cache_priv = ocf_cache_get_priv(cache);
-	mngt_queue = cache_priv->mngt_queue;
-	context = cache_priv->stop_context;
-
 	/*
 	 * Flush cache. Flushing may take a long time, so we allow user
 	 * to interrupt this operation. Hence we do first flush before
@@ -2907,6 +3188,10 @@ int cache_mngt_exit_instance(const char *cache_name, size_t name_len, int flush)
 	status = _cache_mngt_lock_sync(cache);
 	if (status)
 		goto put;
+
+	cache_priv = ocf_cache_get_priv(cache);
+	mngt_queue = cache_priv->mngt_queue;
+	context = cache_priv->stop_context;
 
 	context->finish_thread = cas_lazy_thread_create(exit_instance_finish,
 			context, "cas_%s_stop", cache_name);
@@ -3192,22 +3477,6 @@ unlock:
 put:
 	ocf_mngt_cache_put(cache);
 	return result;
-}
-
-static int cache_mngt_wait_for_rq_finish_visitor(ocf_core_t core, void *cntx)
-{
-	ocf_volume_t obj = ocf_core_get_volume(core);
-	struct vb_object *bdobj = cas_volume_get_vb_object(obj);
-
-	while (env_atomic64_read(&bdobj->pending_rqs))
-		usleep(5000);
-
-	return 0;
-}
-
-void cache_mngt_wait_for_rq_finish(ocf_cache_t cache)
-{
-	ocf_core_visit(cache, cache_mngt_wait_for_rq_finish_visitor, NULL, true);
 }
 
 int cache_mngt_set_core_params(struct kcas_set_core_param *info)

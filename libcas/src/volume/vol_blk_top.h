@@ -32,9 +32,6 @@ struct cas_top_obj {
 
 	const char *dev_name;
 
-	env_atomic pt_ios;
-	env_atomic *pending_rqs;
-
 	void *private;
 };
 

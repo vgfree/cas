@@ -26,11 +26,11 @@ struct vb_object {
 
 	void *private;
 
-	uint32_t expobj_valid : 1;//TODO
+	uint32_t expobj_valid : 1;
 		/*!< Bit indicates that exported object was created */
 
-	env_atomic64 pending_rqs;//TODO
-		/*!< This fields describes in flight IO requests */
+	uint32_t expobj_locked : 1;
+                /*!< Non zero value indicates data exported object is locked */
 
 	ocf_volume_t front_volume;
 		/*< Cache/core front volume */
@@ -41,19 +41,6 @@ static inline struct vb_object *cas_volume_get_vb_object(ocf_volume_t vol)
 	return ocf_volume_get_priv(vol);
 }
 
-
-struct vb_io {
-	int error;
-	env_atomic rq_remaning;
-
-	struct cas_data *data; /* IO data buffer */
-	uint32_t data_offset;//TODO: needed?
-};
-
-static inline struct vb_io *cas_io_to_blkio(struct ocf_io *io)
-{
-	return ocf_io_get_priv(io);
-}
 
 struct vol_btm_driver {
 	struct ocf_volume_properties *properties;
